@@ -1,0 +1,14 @@
+lm_eval
+transformers
+accelerate
+bitsandbytes
+datasets
+swebench
+pandas
+scipy
+torch
+streamlit
+plotly
+deepeval
+openai
+tabulate
