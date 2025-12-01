@@ -1,6 +1,6 @@
 # Model-Benchmark-Suite
 
-A user-friendly streamlit UI for running various lm_eval supported benchmarks on large language models
+A user-friendly streamlit UI for running various lm_eval supported benchmarks on large language models and to compare them with one another.
 
 Supported Benchmarks:
 - gpqa_diamond_zeroshot
