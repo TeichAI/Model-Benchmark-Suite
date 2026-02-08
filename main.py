@@ -71,6 +71,23 @@ def main():
         "--deepeval", action="store_true", help="Run DeepEval on the results"
     )
 
+    parser.add_argument(
+        "--num_fewshot",
+        type=int,
+        default=None,
+        help="Override num_fewshot for all tasks (default: use task YAML/default)",
+    )
+    parser.add_argument(
+        "--override_gen_kwargs",
+        action="store_true",
+        help="Override task generation kwargs with the parameters below",
+    )
+    parser.add_argument(
+        "--do_sample",
+        action="store_true",
+        help="When overriding generation kwargs, enable sampling (default: greedy)",
+    )
+
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)
@@ -113,6 +130,9 @@ def main():
             batch_size=args.batch_size,
             max_model_len=args.max_model_len,
             quantization=args.quantization,
+            num_fewshot=args.num_fewshot,
+            override_gen_kwargs=args.override_gen_kwargs,
+            do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,

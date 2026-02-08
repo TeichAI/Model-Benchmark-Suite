@@ -117,12 +117,57 @@ apply_chat_template = st.sidebar.checkbox(
 )
 overwrite_saved = st.sidebar.checkbox("Overwrite saved results", value=False)
 
+fewshot_mode = st.sidebar.selectbox(
+    "Few-shot",
+    ["Task default (recommended)", "Zero-shot (0)", "Custom"],
+    index=0,
+)
+if fewshot_mode == "Zero-shot (0)":
+    num_fewshot = 0
+elif fewshot_mode == "Custom":
+    num_fewshot = st.sidebar.number_input("num_fewshot", min_value=0, value=5)
+else:
+    num_fewshot = None
+
+override_gen_kwargs = st.sidebar.checkbox(
+    "Override generation settings (advanced)",
+    value=False,
+)
+
 # Sampling Parameters
 with st.sidebar.expander("Sampling Parameters"):
-    temperature = st.slider("Temperature", 0.0, 2.0, 0.6)
-    top_p = st.slider("Top P", 0.0, 1.0, 0.95)
-    top_k = st.number_input("Top K", value=20)
-    repetition_penalty = st.slider("Repetition Penalty", 1.0, 2.0, 1.1)
+    do_sample = st.checkbox(
+        "Enable sampling (not recommended for reproducible benchmarks)",
+        value=False,
+        disabled=not override_gen_kwargs,
+    )
+    temperature = st.slider(
+        "Temperature",
+        0.0,
+        2.0,
+        0.0,
+        disabled=not override_gen_kwargs,
+    )
+    top_p = st.slider(
+        "Top P",
+        0.0,
+        1.0,
+        1.0,
+        disabled=not override_gen_kwargs,
+    )
+    top_k = st.number_input(
+        "Top K",
+        value=0,
+        min_value=0,
+        disabled=not override_gen_kwargs,
+    )
+    repetition_penalty = st.slider(
+        "Repetition Penalty",
+        1.0,
+        2.0,
+        1.0,
+        disabled=not override_gen_kwargs,
+    )
     batch_size = st.number_input("Batch size (lm_eval)", min_value=1, value=1)
 
 # Run / View Controls
@@ -884,10 +929,13 @@ def get_run_config(model, benchmark):
         "max_model_len": int(vllm_max_model_len) if backend == "vllm" else None,
         "allow_code_eval": bool(allow_code_eval),
         "apply_chat_template": bool(apply_chat_template),
-        "temperature": float(temperature),
-        "top_p": float(top_p),
-        "top_k": int(top_k),
-        "repetition_penalty": float(repetition_penalty),
+        "num_fewshot": None if num_fewshot is None else int(num_fewshot),
+        "override_gen_kwargs": bool(override_gen_kwargs),
+        "do_sample": bool(do_sample) if override_gen_kwargs else False,
+        "temperature": float(temperature) if override_gen_kwargs else None,
+        "top_p": float(top_p) if override_gen_kwargs else None,
+        "top_k": int(top_k) if override_gen_kwargs else None,
+        "repetition_penalty": float(repetition_penalty) if override_gen_kwargs else None,
         "batch_size": int(batch_size),
     }
 
@@ -1091,19 +1139,29 @@ elif run_clicked:
                     cmd.extend(["--max_model_len", str(int(vllm_max_model_len))])
 
                 cmd += [
-                    "--temperature",
-                    str(temperature),
-                    "--top_p",
-                    str(top_p),
-                    "--top_k",
-                    str(top_k),
-                    "--repetition_penalty",
-                    str(repetition_penalty),
                     "--batch_size",
                     str(int(batch_size)),
                     "--output",
                     output_file,
                 ]
+
+                if num_fewshot is not None:
+                    cmd.extend(["--num_fewshot", str(int(num_fewshot))])
+
+                if override_gen_kwargs:
+                    cmd.append("--override_gen_kwargs")
+                    if do_sample:
+                        cmd.append("--do_sample")
+                    cmd += [
+                        "--temperature",
+                        str(temperature),
+                        "--top_p",
+                        str(top_p),
+                        "--top_k",
+                        str(top_k),
+                        "--repetition_penalty",
+                        str(repetition_penalty),
+                    ]
 
                 if run_deepeval:
                     cmd.append("--deepeval")

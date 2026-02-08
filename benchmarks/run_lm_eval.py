@@ -14,6 +14,9 @@ def run_lm_eval(
     batch_size=1,
     max_model_len=None,
     quantization="4bit",
+    num_fewshot=None,
+    override_gen_kwargs=False,
+    do_sample=False,
     temperature=0.6,
     top_p=0.95,
     top_k=20,
@@ -60,6 +63,16 @@ def run_lm_eval(
 
     results = None
     try:
+        gen_kwargs = None
+        if override_gen_kwargs:
+            gen_kwargs = {
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+                "do_sample": bool(do_sample),
+            }
+
         if backend == "vllm":
             # vLLM backend: faster inference, Linux/WSL only
             # Auto-detect safe gpu_memory_utilization based on free memory
@@ -93,18 +106,12 @@ def run_lm_eval(
                 model="vllm",
                 model_args=model_args,
                 tasks=tasks_list,
-                num_fewshot=0,
+                num_fewshot=num_fewshot,
                 batch_size="auto",
                 limit=limit,
                 confirm_run_unsafe_code=allow_code_eval,
                 apply_chat_template=apply_chat_template,
-                gen_kwargs={
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "top_k": top_k,
-                    "repetition_penalty": repetition_penalty,
-                    "do_sample": True,
-                },
+                gen_kwargs=gen_kwargs,
                 log_samples=True,
             )
         else:
@@ -136,19 +143,13 @@ def run_lm_eval(
                 model="hf",
                 model_args=model_args,
                 tasks=tasks_list,
-                num_fewshot=0,
+                num_fewshot=num_fewshot,
                 batch_size=batch_size,
                 limit=limit,
                 device=device,
                 confirm_run_unsafe_code=allow_code_eval,
                 apply_chat_template=apply_chat_template,
-                gen_kwargs={
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "top_k": top_k,
-                    "repetition_penalty": repetition_penalty,
-                    "do_sample": True,
-                },
+                gen_kwargs=gen_kwargs,
                 log_samples=True,
             )
 
