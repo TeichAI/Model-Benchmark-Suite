@@ -12,6 +12,7 @@ import plotly.io as pio
 import tempfile
 import time
 import signal
+import datetime
 from collections import deque
 
 PLOTLY_DOWNLOAD_CONFIG = {
@@ -212,134 +213,185 @@ def render_results(results_data):
         st.info("No data for current selection.")
         return
 
-    key_takeaways = []
+    score_matrix = (
+        filtered_df.pivot_table(
+            index="Benchmark", columns="Model", values="Score", aggfunc="mean"
+        )
+        .reindex(columns=selected_models)
+        .sort_index()
+    )
+
+    def _highlight_row_winners(row):
+        valid = row.dropna()
+        if valid.empty:
+            return ["" for _ in row]
+        winner = valid.max()
+        return [
+            "background-color: #dcfce7; font-weight: 700;"
+            if pd.notna(v) and v == winner
+            else ""
+            for v in row
+        ]
+
+    def _score_to_text(v):
+        return "-" if pd.isna(v) else f"{float(v):.3f}"
+
+    def _score_to_md(v, is_winner):
+        if pd.isna(v):
+            return "-"
+        value = f"{float(v):.3f}"
+        return f"**{value}**" if is_winner else value
+
+    def _safe_to_markdown(table_df):
+        try:
+            return table_df.to_markdown(index=False)
+        except ImportError:
+            return table_df.to_csv(index=False)
+
+    matrix_md_rows = []
+    for benchmark_name, row in score_matrix.iterrows():
+        valid = row.dropna()
+        winner_score = valid.max() if not valid.empty else None
+        row_data = {"Benchmark": benchmark_name}
+        for model_name in score_matrix.columns:
+            value = row[model_name]
+            is_winner = pd.notna(value) and winner_score is not None and value == winner_score
+            row_data[model_name] = _score_to_md(value, is_winner)
+        matrix_md_rows.append(row_data)
+
+    score_matrix_md_df = pd.DataFrame(matrix_md_rows)
+
+    st.subheader("Head-to-Head Score Matrix")
+    st.caption(
+        "Rows are benchmarks, columns are models. Best score in each row is highlighted."
+    )
+    st.dataframe(
+        score_matrix.style.format("{:.3f}", na_rep="-").apply(
+            _highlight_row_winners, axis=1
+        ),
+        use_container_width=True,
+    )
+
+    with st.expander("View matrix in markdown format"):
+        st.markdown(_safe_to_markdown(score_matrix_md_df))
 
     base_model = st.selectbox(
-        "Base model for comparison",
+        "Base model for win/loss analysis",
         options=selected_models,
         index=0,
         key="base_model_select",
     )
     compare_options = [m for m in selected_models if m != base_model]
-    comparison_df = None
-    comparison_summary_df = None
-    if compare_options:
-        compare_models = st.multiselect(
-            "Models to compare vs base",
-            options=compare_options,
-            default=compare_options,
-            key="compare_models_select",
-        )
-        if compare_models:
-            try:
-                pivot = filtered_df.pivot_table(
-                    index="Benchmark", columns="Model", values="Score", aggfunc="mean"
-                )
-                if base_model in pivot.columns:
-                    rows = []
-                    for model in compare_models:
-                        if model not in pivot.columns:
-                            continue
-                        sub = pd.DataFrame(
-                            {
-                                "Benchmark": pivot.index,
-                                "Base Model": base_model,
-                                "Compare Model": model,
-                                "Base Score": pivot[base_model],
-                                "Model Score": pivot[model],
-                            }
-                        ).dropna()
-                        if not sub.empty:
-                            sub["Delta"] = sub["Model Score"] - sub["Base Score"]
-                            denom = sub["Base Score"].where(sub["Base Score"] != 0)
-                            sub["Delta %"] = sub["Delta"] / denom
-                            rows.append(sub)
-                    if rows:
-                        comparison_df = pd.concat(rows, ignore_index=True)
-                        summary_rows = []
-                        for model, group in comparison_df.groupby("Compare Model"):
-                            wins = (group["Delta"] > 0).sum()
-                            ties = (group["Delta"] == 0).sum()
-                            losses = (group["Delta"] < 0).sum()
-                            avg_delta = group["Delta"].mean()
-                            summary_rows.append(
-                                {
-                                    "Compare Model": model,
-                                    "Benchmarks Compared": int(len(group)),
-                                    "Wins vs Base": int(wins),
-                                    "Ties vs Base": int(ties),
-                                    "Losses vs Base": int(losses),
-                                    "Avg Delta": float(avg_delta),
-                                }
-                            )
-                        if summary_rows:
-                            summary_df = pd.DataFrame(summary_rows)
-                            summary_df = summary_df.sort_values(
-                                "Avg Delta", ascending=False
-                            )
-                            comparison_summary_df = summary_df
+    compare_models = st.multiselect(
+        "Compare these models against base",
+        options=compare_options,
+        default=compare_options,
+        key="compare_models_select",
+    )
 
-                            key_takeaways = []
+    comparison_summary_df = pd.DataFrame()
+    benchmark_outcome_df = pd.DataFrame()
+    key_takeaways = []
 
-                            def _fmt_pct(v):
-                                return f"{v:.1%}" if pd.notna(v) else "n/a"
+    if compare_models and base_model in score_matrix.columns:
+        summary_rows = []
+        for model_name in compare_models:
+            if model_name not in score_matrix.columns:
+                continue
+            pair = score_matrix[[base_model, model_name]].dropna()
+            if pair.empty:
+                continue
+            base_wins = int((pair[base_model] > pair[model_name]).sum())
+            base_losses = int((pair[base_model] < pair[model_name]).sum())
+            ties = int((pair[base_model] == pair[model_name]).sum())
+            avg_delta = float((pair[base_model] - pair[model_name]).mean())
+            summary_rows.append(
+                {
+                    "Model": model_name,
+                    "Benchmarks Compared": int(len(pair)),
+                    "Base Wins": base_wins,
+                    "Base Losses": base_losses,
+                    "Ties": ties,
+                    "Avg Delta (Base-Model)": avg_delta,
+                }
+            )
 
-                            if not summary_df.empty:
-                                top = summary_df.iloc[0]
-                                key_takeaways.append(
-                                    f"Overall vs {base_model}, {top['Compare Model']} has the best average score "
-                                    f"(Avg Δ={top['Avg Delta']:.3f} across {int(top['Benchmarks Compared'])} benchmarks)."
-                                )
-                                if len(summary_df) > 1:
-                                    bottom = summary_df.iloc[-1]
-                                    desc = (
-                                        "worst average score"
-                                        if bottom["Avg Delta"] < 0
-                                        else "lowest average gain"
-                                    )
-                                    key_takeaways.append(
-                                        f"Overall vs {base_model}, {bottom['Compare Model']} has the {desc} "
-                                        f"(Avg Δ={bottom['Avg Delta']:.3f} across {int(bottom['Benchmarks Compared'])} benchmarks)."
-                                    )
+        if summary_rows:
+            comparison_summary_df = pd.DataFrame(summary_rows).sort_values(
+                "Avg Delta (Base-Model)", ascending=False
+            )
 
-                            for model in summary_df["Compare Model"]:
-                                group = comparison_df[
-                                    comparison_df["Compare Model"] == model
-                                ]
-                                if group.empty:
-                                    continue
-                                best_idx = group["Delta"].idxmax()
-                                worst_idx = group["Delta"].idxmin()
-                                best = group.loc[best_idx]
-                                worst = group.loc[worst_idx]
-                                key_takeaways.append(
-                                    f"For {model} vs {base_model}, the largest gain is on {best['Benchmark']} "
-                                    f"(Δ={best['Delta']:.3f}, rel={_fmt_pct(best['Delta %'])}), while the largest drop is on {worst['Benchmark']} "
-                                    f"(Δ={worst['Delta']:.3f}, rel={_fmt_pct(worst['Delta %'])})."
-                                )
-            except Exception:
-                comparison_df = None
-                comparison_summary_df = None
-    if comparison_df is not None and not comparison_df.empty:
-        st.subheader("Model Comparison vs Base")
+        outcome_rows = []
+        for benchmark_name, row in score_matrix.iterrows():
+            base_score = row.get(base_model)
+            if pd.isna(base_score):
+                continue
+            competitor_scores = row[compare_models].dropna()
+            if competitor_scores.empty:
+                continue
+            best_competitor = competitor_scores.idxmax()
+            best_competitor_score = float(competitor_scores.max())
+            delta = float(base_score - best_competitor_score)
+            if delta > 0:
+                outcome = "Win"
+            elif delta < 0:
+                outcome = "Loss"
+            else:
+                outcome = "Tie"
+            outcome_rows.append(
+                {
+                    "Benchmark": benchmark_name,
+                    "Base Score": float(base_score),
+                    "Best Opponent": best_competitor,
+                    "Opponent Score": best_competitor_score,
+                    "Delta (Base-Opponent)": delta,
+                    "Outcome": outcome,
+                }
+            )
+
+        if outcome_rows:
+            benchmark_outcome_df = pd.DataFrame(outcome_rows).sort_values("Benchmark")
+
+        if not benchmark_outcome_df.empty:
+            wins = int((benchmark_outcome_df["Outcome"] == "Win").sum())
+            losses = int((benchmark_outcome_df["Outcome"] == "Loss").sum())
+            ties = int((benchmark_outcome_df["Outcome"] == "Tie").sum())
+            key_takeaways.append(
+                f"{base_model}: {wins} wins, {losses} losses, {ties} ties across selected benchmarks."
+            )
+        if not comparison_summary_df.empty:
+            strongest = comparison_summary_df.iloc[-1]
+            weakest = comparison_summary_df.iloc[0]
+            key_takeaways.append(
+                f"Hardest competitor vs base: {strongest['Model']} (Avg Δ={strongest['Avg Delta (Base-Model)']:.3f})."
+            )
+            key_takeaways.append(
+                f"Easiest competitor vs base: {weakest['Model']} (Avg Δ={weakest['Avg Delta (Base-Model)']:.3f})."
+            )
+
+    if not benchmark_outcome_df.empty:
+        st.subheader("Where Base Model Wins/Loses")
         st.dataframe(
-            comparison_df[
-                [
-                    "Compare Model",
-                    "Benchmark",
-                    "Base Score",
-                    "Model Score",
-                    "Delta",
-                    "Delta %",
-                ]
-            ]
+            benchmark_outcome_df.style.format(
+                {
+                    "Base Score": "{:.3f}",
+                    "Opponent Score": "{:.3f}",
+                    "Delta (Base-Opponent)": "{:.3f}",
+                }
+            ),
+            use_container_width=True,
         )
-    if comparison_summary_df is not None and not comparison_summary_df.empty:
-        st.dataframe(comparison_summary_df)
+
+    if not comparison_summary_df.empty:
+        st.subheader("Base vs Variant Summary")
+        st.dataframe(
+            comparison_summary_df.style.format({"Avg Delta (Base-Model)": "{:.3f}"}),
+            use_container_width=True,
+        )
 
     if key_takeaways:
-        st.subheader("Key Takeaways")
-        for line in key_takeaways[:6]:
+        st.subheader("Quick Read")
+        for line in key_takeaways:
             st.markdown(f"- {line}")
 
     # Bar Chart
@@ -370,76 +422,53 @@ def render_results(results_data):
         config=PLOTLY_DOWNLOAD_CONFIG,
     )
 
-    # Data Table
-    st.dataframe(
-        filtered_df[["Model", "Benchmark", "Score", "Total Questions", "Total Correct"]]
-    )
+    with st.expander("View long-form rows"):
+        st.dataframe(
+            filtered_df[
+                ["Model", "Benchmark", "Score", "Total Questions", "Total Correct"]
+            ],
+            use_container_width=True,
+        )
 
     # Raw Data Expander (full, unfiltered data)
     with st.expander("View Raw Results"):
         st.json(results_data)
 
     # Export to Markdown / ZIP / PDF (filtered view)
-    import datetime
-
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     display_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Generate Markdown Content
-    md_content = f"# Benchmark Results Report\n\n"
+    md_content = "# Benchmark Results Report\n\n"
     md_content += f"**Date:** {display_timestamp}\n\n"
-    md_content += f"## Configuration\n"
+    md_content += "## Configuration\n"
     md_content += f"- **Quantization:** {quantization}\n"
     md_content += f"- **Temperature:** {temperature}\n"
     md_content += f"- **Top P:** {top_p}\n"
     md_content += f"- **Top K:** {top_k}\n"
-    md_content += f"- **Repetition Penalty:** {repetition_penalty}\n\n"
+    md_content += f"- **Repetition Penalty:** {repetition_penalty}\n"
+    md_content += f"- **Base Model:** {base_model}\n\n"
 
-    md_content += "## Results\n\n"
-    md_content += '![alt="Results Bar Chart"](results_bar_chart.png)\n\n'
+    md_content += "## Head-to-Head Score Matrix\n\n"
+    md_content += _safe_to_markdown(score_matrix_md_df)
 
-    md_content += "## Detailed Results\n\n"
-    try:
-        md_table = filtered_df[
-            ["Model", "Benchmark", "Score", "Total Questions", "Total Correct"]
-        ].to_markdown(index=False)
-    except ImportError:
-        md_table = filtered_df[
-            ["Model", "Benchmark", "Score", "Total Questions", "Total Correct"]
-        ].to_csv(index=False)
-    md_content += md_table
+    if not benchmark_outcome_df.empty:
+        md_content += "\n\n## Where Base Model Wins/Loses\n\n"
+        benchmark_outcome_export = benchmark_outcome_df.copy()
+        md_content += _safe_to_markdown(benchmark_outcome_export)
 
-    if comparison_df is not None and not comparison_df.empty:
-        md_content += "\n\n## Model Comparison vs Base\n\n"
-        md_content += f"- Base model: {base_model}\n\n"
-        comp_export = comparison_df[
-            [
-                "Compare Model",
-                "Benchmark",
-                "Base Score",
-                "Model Score",
-                "Delta",
-                "Delta %",
-            ]
-        ].copy()
-        try:
-            md_comp_table = comp_export.to_markdown(index=False)
-        except ImportError:
-            md_comp_table = comp_export.to_csv(index=False)
-        md_content += md_comp_table
-
-        if comparison_summary_df is not None and not comparison_summary_df.empty:
-            md_content += "\n\n### Aggregate Comparison\n\n"
-            try:
-                md_summary_table = comparison_summary_df.to_markdown(index=False)
-            except ImportError:
-                md_summary_table = comparison_summary_df.to_csv(index=False)
-            md_content += md_summary_table
+    if not comparison_summary_df.empty:
+        md_content += "\n\n## Base vs Variant Summary\n\n"
+        md_content += _safe_to_markdown(comparison_summary_df)
 
     if key_takeaways:
-        md_content += "\n\n## Key Takeaways\n\n"
-        for line in key_takeaways[:6]:
+        md_content += "\n\n## Quick Read\n\n"
+        for line in key_takeaways:
             md_content += f"- {line}\n"
+
+    md_content += "\n\n## Full Row Data\n\n"
+    md_content += _safe_to_markdown(
+        filtered_df[["Model", "Benchmark", "Score", "Total Questions", "Total Correct"]]
+    )
 
     mmlu_filtered = None
     mmlu_subject_results = st.session_state.get("mmlu_subject_results")
@@ -536,6 +565,7 @@ def render_results(results_data):
             st.warning(f"Failed to generate MMLU chart image for PDF/ZIP export: {e}")
 
     zip_bytes = None
+    zip_error = None
     try:
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -545,10 +575,12 @@ def render_results(results_data):
             if mmlu_image_bytes is not None:
                 zf.writestr("mmlu_subject_breakdown.png", mmlu_image_bytes)
         zip_bytes = zip_buffer.getvalue()
-    except Exception:
+    except Exception as e:
         zip_bytes = None
+        zip_error = str(e)
 
     pdf_bytes = None
+    pdf_error = None
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.platypus import (
@@ -557,6 +589,8 @@ def render_results(results_data):
             Spacer,
             Image as RLImage,
             PageBreak,
+            Table,
+            TableStyle,
         )
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib import colors
@@ -597,6 +631,57 @@ def render_results(results_data):
             leading=13,
         )
 
+        def _build_table(table_df, highlight_winners=False):
+            cols = list(table_df.columns)
+            data = [cols]
+            for _, row in table_df.iterrows():
+                data.append([str(row[c]) for c in cols])
+
+            report_table = Table(data, repeatRows=1)
+            style_cmds = [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F2937")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F9FAFB")]),
+            ]
+
+            if highlight_winners and cols and cols[0] == "Benchmark":
+                model_cols = cols[1:]
+                for row_idx, (_, row) in enumerate(table_df.iterrows(), start=1):
+                    numeric_scores = []
+                    for model_name in model_cols:
+                        try:
+                            numeric_scores.append(float(row[model_name]))
+                        except Exception:
+                            numeric_scores.append(float("nan"))
+                    clean_scores = [s for s in numeric_scores if pd.notna(s)]
+                    if not clean_scores:
+                        continue
+                    winner_score = max(clean_scores)
+                    for col_idx, score in enumerate(numeric_scores, start=1):
+                        if pd.notna(score) and score == winner_score:
+                            style_cmds.append(
+                                (
+                                    "FONTNAME",
+                                    (col_idx, row_idx),
+                                    (col_idx, row_idx),
+                                    "Helvetica-Bold",
+                                )
+                            )
+                            style_cmds.append(
+                                (
+                                    "BACKGROUND",
+                                    (col_idx, row_idx),
+                                    (col_idx, row_idx),
+                                    colors.HexColor("#DCFCE7"),
+                                )
+                            )
+
+            report_table.setStyle(TableStyle(style_cmds))
+            return report_table
+
         elements = []
 
         # Title
@@ -611,15 +696,39 @@ def render_results(results_data):
         elements.append(
             Paragraph(f"<b>Repetition Penalty:</b> {repetition_penalty}", body_style)
         )
+        elements.append(Paragraph(f"<b>Base Model:</b> {base_model}", body_style))
 
-        # Key Takeaways
         if key_takeaways:
             elements.append(Spacer(1, 12))
-            elements.append(Paragraph("Key Takeaways", heading_style))
-            for line in key_takeaways[:6]:
+            elements.append(Paragraph("Quick Read", heading_style))
+            for line in key_takeaways:
                 elements.append(Paragraph(f"• {line}", body_style))
 
-        # Results chart page
+        elements.append(Spacer(1, 12))
+        elements.append(Paragraph("Head-to-Head Score Matrix", heading_style))
+        matrix_pdf = score_matrix.reset_index().copy()
+        for model_name in selected_models:
+            if model_name in matrix_pdf.columns:
+                matrix_pdf[model_name] = matrix_pdf[model_name].map(_score_to_text)
+        elements.append(_build_table(matrix_pdf, highlight_winners=True))
+
+        if not benchmark_outcome_df.empty:
+            elements.append(Spacer(1, 12))
+            elements.append(Paragraph("Where Base Model Wins/Loses", heading_style))
+            outcome_pdf = benchmark_outcome_df.copy()
+            for col in ["Base Score", "Opponent Score", "Delta (Base-Opponent)"]:
+                outcome_pdf[col] = outcome_pdf[col].map(lambda v: f"{float(v):.3f}")
+            elements.append(_build_table(outcome_pdf))
+
+        if not comparison_summary_df.empty:
+            elements.append(Spacer(1, 12))
+            elements.append(Paragraph("Base vs Variant Summary", heading_style))
+            summary_pdf = comparison_summary_df.copy()
+            summary_pdf["Avg Delta (Base-Model)"] = summary_pdf[
+                "Avg Delta (Base-Model)"
+            ].map(lambda v: f"{float(v):.3f}")
+            elements.append(_build_table(summary_pdf))
+
         if results_image_bytes is not None:
             elements.append(PageBreak())
             elements.append(Paragraph("Benchmark Results", heading_style))
@@ -630,7 +739,6 @@ def render_results(results_data):
             img.hAlign = "CENTER"
             elements.append(img)
 
-        # MMLU chart page
         if mmlu_image_bytes is not None:
             elements.append(PageBreak())
             elements.append(Paragraph("MMLU Subject Breakdown", heading_style))
@@ -643,11 +751,12 @@ def render_results(results_data):
 
         doc.build(elements)
         pdf_bytes = pdf_buffer.getvalue()
-    except Exception:
+    except Exception as e:
         pdf_bytes = None
+        pdf_error = str(e)
 
     st.download_button(
-        label="Download Report as Markdown",
+        label="Download Clean Markdown Report",
         data=md_content,
         file_name=f"benchmark_report_{timestamp}.md",
         mime="text/markdown",
@@ -655,28 +764,29 @@ def render_results(results_data):
 
     if zip_bytes is not None:
         st.download_button(
-            label="Download Report as Markdown ZIP (with images)",
+            label="Download Markdown ZIP (report + charts)",
             data=zip_bytes,
             file_name=f"benchmark_report_{timestamp}.zip",
             mime="application/zip",
         )
     else:
         st.info(
-            "Markdown ZIP export with images requires the 'kaleido' package for Plotly. "
-            "Install it with `pip install -U kaleido` and restart the app."
+            "ZIP export failed. "
+            f"Reason: {zip_error or 'unknown error'}."
         )
 
     if pdf_bytes is not None:
         st.download_button(
-            label="Download Report as PDF (with images)",
+            label="Download PDF Report",
             data=pdf_bytes,
             file_name=f"benchmark_report_{timestamp}.pdf",
             mime="application/pdf",
         )
     else:
         st.info(
-            "PDF export requires the 'reportlab' package (and 'kaleido' for chart images). "
-            "Install them with `pip install reportlab kaleido` and restart the app."
+            "PDF export failed. "
+            f"Reason: {pdf_error or 'unknown error'}. "
+            "Install/update `reportlab` (and `kaleido` if you want chart images)."
         )
 
     # --- DeepEval Qualitative Analysis ---
