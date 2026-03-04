@@ -1,6 +1,7 @@
 lm_eval[ifeval,sentencepiece,vllm]
 huggingface_hub
 hf_transfer
+kaleido
 evaluate
 transformers
 accelerate
