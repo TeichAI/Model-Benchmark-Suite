@@ -15,6 +15,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def parse_json_object_arg(value):
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("--chat_template_kwargs must be a JSON object")
+    return parsed
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark models with lm_eval")
     parser.add_argument(
@@ -115,14 +127,32 @@ def main():
         action="store_true",
         help="Apply chat template for instruct/chat models",
     )
+    parser.add_argument(
+        "--chat_template_args",
+        "--chat_template_kwargs",
+        dest="chat_template_kwargs",
+        type=str,
+        default=None,
+        help='JSON object of kwargs passed into the model chat template, e.g. {"enable_thinking": true}',
+    )
 
     args = parser.parse_args()
+
+    if args.backend == "vllm" and sys.platform.startswith("win"):
+        message = (
+            "vLLM backend is not supported on native Windows. "
+            "Use the hf backend or run under Linux/WSL."
+        )
+        print(message)
+        logger.error(message)
+        return 1
 
     results = {}
 
     # Run lm_eval on the requested tasks
     try:
         tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        chat_template_kwargs = parse_json_object_arg(args.chat_template_kwargs)
         results["lm_eval"] = run_lm_eval(
             args.model,
             tasks,
@@ -140,6 +170,9 @@ def main():
             hf_token=args.hf_token,
             allow_code_eval=args.allow_code_eval,
             apply_chat_template=args.apply_chat_template,
+            chat_template_kwargs=(
+                chat_template_kwargs if args.apply_chat_template else None
+            ),
             backend=args.backend,
         )
     except Exception as e:
@@ -148,7 +181,7 @@ def main():
         tb = traceback.format_exc()
         print(f"LM Eval Failed: {e}\n{tb}")
         logger.error(f"LM Eval Failed: {e}\n{tb}")
-        results["lm_eval"] = str(e)
+        return 1
 
     class CustomEncoder(json.JSONEncoder):
         def default(self, obj):
@@ -178,6 +211,8 @@ def main():
             print(f"DeepEval Failed: {e}")
             logger.error(f"DeepEval Failed: {e}")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

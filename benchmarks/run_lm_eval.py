@@ -1,6 +1,7 @@
 import argparse
 import os
 import gc
+import sys
 import torch
 from lm_eval import tasks, evaluator, utils
 from lm_eval.models.huggingface import HFLM
@@ -9,7 +10,7 @@ from lm_eval.models.utils_hf import clear_torch_cache
 
 def run_lm_eval(
     model_name,
-    tasks_list=["gpqa_diamond_zeroshot"],
+    tasks_list=None,
     limit=None,
     batch_size=1,
     max_model_len=None,
@@ -24,9 +25,23 @@ def run_lm_eval(
     hf_token=None,
     allow_code_eval=False,
     apply_chat_template=False,
+    chat_template_kwargs=None,
     backend="hf",
 ):
+    if tasks_list is None:
+        tasks_list = ["gpqa_diamond_zeroshot"]
     tasks_list = list(tasks_list)
+    chat_template_kwargs = (
+        dict(chat_template_kwargs)
+        if apply_chat_template and chat_template_kwargs
+        else None
+    )
+
+    if backend == "vllm" and sys.platform.startswith("win"):
+        raise RuntimeError(
+            "vLLM backend is not supported on native Windows. Use the hf backend or run under Linux/WSL."
+        )
+
     if apply_chat_template and "humaneval" in tasks_list:
         tasks_list = [
             "humaneval_instruct" if task == "humaneval" else task
@@ -89,15 +104,21 @@ def run_lm_eval(
             if max_model_len is None:
                 max_model_len = os.getenv("VLLM_MAX_MODEL_LEN", "8192")
             max_model_len = int(max_model_len)
-            model_args = (
-                f"pretrained={model_name},dtype=auto,"
-                f"gpu_memory_utilization={gpu_mem_util},"
-                f"trust_remote_code=True,max_model_len={max_model_len}"
-            )
+            model_args = {
+                "pretrained": model_name,
+                "dtype": "auto",
+                "gpu_memory_utilization": gpu_mem_util,
+                "trust_remote_code": True,
+                "max_model_len": max_model_len,
+            }
 
             # Apply quantization for vLLM (bitsandbytes 4bit/8bit)
             if quantization in ("4bit", "8bit"):
-                model_args += ",quantization=bitsandbytes,load_format=bitsandbytes"
+                model_args["quantization"] = "bitsandbytes"
+                model_args["load_format"] = "bitsandbytes"
+
+            if chat_template_kwargs:
+                model_args["chat_template_args"] = dict(chat_template_kwargs)
 
             # Avoid embedding tokens in model_args (results JSON stores model_args)
             # Authentication is handled via HF_TOKEN env var above.
@@ -116,26 +137,37 @@ def run_lm_eval(
             )
         else:
             # HuggingFace Transformers backend (default)
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
             if quantization == "4bit":
-                model_args = (
-                    f"pretrained={model_name},load_in_4bit=True,trust_remote_code=True"
-                )
+                model_args = {
+                    "pretrained": model_name,
+                    "load_in_4bit": True,
+                    "trust_remote_code": True,
+                }
             elif quantization == "8bit":
-                model_args = (
-                    f"pretrained={model_name},load_in_8bit=True,trust_remote_code=True"
-                )
-            else:  # None or bf16
-                model_args = (
-                    f"pretrained={model_name},dtype=bfloat16,trust_remote_code=True"
+                model_args = {
+                    "pretrained": model_name,
+                    "load_in_8bit": True,
+                    "trust_remote_code": True,
+                }
+            else:
+                dtype = "bfloat16" if device == "cuda:0" else "float32"
+                model_args = {
+                    "pretrained": model_name,
+                    "dtype": dtype,
+                    "trust_remote_code": True,
+                }
+
+            if chat_template_kwargs:
+                model_args["chat_template_args"] = dict(chat_template_kwargs)
+                model_args["enable_thinking"] = chat_template_kwargs.get(
+                    "enable_thinking", False
                 )
 
             # Avoid embedding tokens in model_args (results JSON stores model_args)
             # Authentication is handled via HF_TOKEN env var above.
 
-            # Auto-detect device instead of hard-coding CUDA
-            if torch.cuda.is_available():
-                device = "cuda:0"
-            else:
+            if device == "cpu":
                 device = "cpu"
                 print("CUDA not available, using CPU. This may be slow for large models.")
 

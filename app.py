@@ -14,6 +14,7 @@ import time
 import signal
 import datetime
 from collections import deque
+from urllib.parse import quote, unquote
 
 PLOTLY_DOWNLOAD_CONFIG = {
     "toImageButtonOptions": {
@@ -33,11 +34,26 @@ PLOTLY_MMLU_DOWNLOAD_CONFIG = {
     }
 }
 
+def parse_json_object_input(value, field_name):
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} must be valid JSON: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field_name} must be a JSON object")
+    return parsed
+
 st.set_page_config(page_title="TeichAI Benchmark Suite", layout="wide")
 
 st.title("TeichAI Model Benchmark Suite")
 
 results_placeholder = st.empty()
+native_windows = sys.platform.startswith("win")
 
 # --- Sidebar Configuration ---
 st.sidebar.header("Configuration")
@@ -83,13 +99,18 @@ with st.sidebar.expander("HuggingFace Token"):
         st.success("Token provided ✓")
 
 # Settings
+backend_options = ["hf"] if native_windows else ["hf", "vllm"]
 backend = st.sidebar.selectbox(
     "Inference Backend",
-    ["hf", "vllm"],
+    backend_options,
     index=0,
     help="'hf' = HuggingFace Transformers (works everywhere). "
     "'vllm' = vLLM (Linux/WSL only, much faster for generation tasks like ifeval/humaneval).",
 )
+if native_windows:
+    st.sidebar.info(
+        "Native Windows detected: `vllm` is disabled in the UI. Use `hf` or run the suite under Linux/WSL for `vllm`."
+    )
 quantization = st.sidebar.selectbox("Quantization", ["4bit", "8bit", "none"], index=0)
 vllm_max_model_len_default = int(os.getenv("VLLM_MAX_MODEL_LEN", "8192"))
 vllm_max_model_len = st.sidebar.number_input(
@@ -116,6 +137,25 @@ apply_chat_template = st.sidebar.checkbox(
     value=True,
     help="Recommended for instruct/chat models to format prompts correctly.",
 )
+chat_template_kwargs_input = st.sidebar.text_area(
+    "Chat template kwargs (JSON)",
+    value="",
+    height=80,
+    disabled=not apply_chat_template,
+    help='Optional JSON object passed into the model chat template, e.g. {"enable_thinking": true}.',
+)
+chat_template_kwargs = None
+chat_template_kwargs_error = None
+if apply_chat_template:
+    try:
+        chat_template_kwargs = parse_json_object_input(
+            chat_template_kwargs_input,
+            "Chat template kwargs",
+        )
+    except ValueError as exc:
+        chat_template_kwargs_error = str(exc)
+        if chat_template_kwargs_input.strip():
+            st.sidebar.error(chat_template_kwargs_error)
 overwrite_saved = st.sidebar.checkbox("Overwrite saved results", value=False)
 
 fewshot_mode = st.sidebar.selectbox(
@@ -176,6 +216,70 @@ view_saved_only = st.sidebar.checkbox(
     "View saved results only (no new runs)", value=False
 )
 run_clicked = st.sidebar.button("Run Benchmarks", type="primary")
+
+
+def is_valid_lm_eval_payload(data):
+    if not isinstance(data, dict):
+        return False
+
+    lm_data = data.get("lm_eval")
+    if not isinstance(lm_data, dict):
+        return False
+
+    lm_results = lm_data.get("results")
+    return isinstance(lm_results, dict) and bool(lm_results)
+
+
+def get_model_filename_keys(model):
+    model_text = str(model)
+    keys = [quote(model_text, safe="")]
+    legacy_key = model_text.replace("/", "_")
+    if legacy_key not in keys:
+        keys.append(legacy_key)
+    return keys
+
+
+def get_cache_path(model, benchmark):
+    return os.path.join(
+        "saved_results", f"results_{get_model_filename_keys(model)[0]}_{benchmark}.json"
+    )
+
+
+def get_cache_path_candidates(model, benchmark):
+    return [
+        os.path.join("saved_results", f"results_{key}_{benchmark}.json")
+        for key in get_model_filename_keys(model)
+    ]
+
+
+def get_raw_result_path(model, benchmark):
+    return os.path.join(
+        "saved_results",
+        f"results_raw_{get_model_filename_keys(model)[0]}_{benchmark}.json",
+    )
+
+
+def get_deepeval_result_path_candidates(model, benchmark):
+    candidates = [
+        os.path.join("saved_results", f"results_raw_{key}_{benchmark}_deepeval.json")
+        for key in get_model_filename_keys(model)
+    ]
+    candidates.extend(
+        f"results_{key}_{benchmark}_deepeval.json"
+        for key in get_model_filename_keys(model)
+    )
+    return list(dict.fromkeys(candidates))
+
+
+def load_json_file(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def unpack_result_payload(payload):
+    if isinstance(payload, dict) and "data" in payload:
+        return payload.get("config"), payload.get("data")
+    return None, payload
 
 
 def render_results(results_data):
@@ -798,20 +902,17 @@ def render_results(results_data):
         for item in results_data:
             model = item["Model"]
             benchmark = item["Benchmark"]
-            safe_model = model.replace("/", "_")
-            # Preferred: new location under saved_results, matching lm_eval raw outputs
-            result_file = os.path.join(
-                "saved_results",
-                f"results_raw_{safe_model}_{benchmark}_deepeval.json",
+            result_file = next(
+                (
+                    path
+                    for path in get_deepeval_result_path_candidates(model, benchmark)
+                    if os.path.exists(path)
+                ),
+                None,
             )
 
-            # Backwards compatibility: fall back to old root-level naming if needed
-            if not os.path.exists(result_file):
-                legacy_file = f"results_{safe_model}_{benchmark}_deepeval.json"
-                if os.path.exists(legacy_file):
-                    result_file = legacy_file
-                else:
-                    continue
+            if not result_file:
+                continue
 
             if os.path.exists(result_file):
                 with open(result_file, "r") as f:
@@ -1039,6 +1140,7 @@ def get_run_config(model, benchmark):
         "max_model_len": int(vllm_max_model_len) if backend == "vllm" else None,
         "allow_code_eval": bool(allow_code_eval),
         "apply_chat_template": bool(apply_chat_template),
+        "chat_template_kwargs": chat_template_kwargs if apply_chat_template else None,
         "num_fewshot": None if num_fewshot is None else int(num_fewshot),
         "override_gen_kwargs": bool(override_gen_kwargs),
         "do_sample": bool(do_sample) if override_gen_kwargs else False,
@@ -1048,11 +1150,6 @@ def get_run_config(model, benchmark):
         "repetition_penalty": float(repetition_penalty) if override_gen_kwargs else None,
         "batch_size": int(batch_size),
     }
-
-
-def get_cache_path(model, benchmark):
-    safe_model = model.replace("/", "_")
-    return os.path.join("saved_results", f"results_{safe_model}_{benchmark}.json")
 
 
 def load_all_saved_results():
@@ -1070,8 +1167,7 @@ def load_all_saved_results():
 
         path = os.path.join(saved_dir, fname)
         try:
-            with open(path, "r") as f:
-                data = json.load(f)
+            _, data = unpack_result_payload(load_json_file(path))
         except Exception:
             continue
 
@@ -1107,7 +1203,11 @@ def load_all_saved_results():
                     if core.endswith(suffix):
                         safe_model = core[: -len(suffix)]
                         if safe_model:
-                            model = safe_model.replace("_", "/")
+                            decoded_model = unquote(safe_model)
+                            if decoded_model != safe_model or "%" in safe_model:
+                                model = decoded_model
+                            else:
+                                model = safe_model.replace("_", "/")
 
             if not model:
                 # Skip unresolved models instead of labeling them as "unknown_model".
@@ -1154,6 +1254,8 @@ elif run_clicked:
         st.error("Please specify at least one model.")
     elif not benchmarks:
         st.error("Please select at least one benchmark.")
+    elif chat_template_kwargs_error:
+        st.error(chat_template_kwargs_error)
     else:
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -1172,26 +1274,35 @@ elif run_clicked:
                 progress_bar.progress(progress)
 
                 cache_path = get_cache_path(model, benchmark)
+                existing_cache_path = next(
+                    (
+                        path
+                        for path in get_cache_path_candidates(model, benchmark)
+                        if os.path.exists(path)
+                    ),
+                    None,
+                )
 
-                if os.path.exists(cache_path) and not overwrite_saved:
+                if existing_cache_path and not overwrite_saved:
                     try:
-                        with open(cache_path, "r") as f:
-                            cached_payload = json.load(f)
+                        cached_config, data = unpack_result_payload(
+                            load_json_file(existing_cache_path)
+                        )
 
-                        if (
-                            isinstance(cached_payload, dict)
-                            and "data" in cached_payload
-                        ):
-                            cached_config = cached_payload.get("config")
-                            data = cached_payload.get("data")
-                        else:
-                            # Backwards compatibility: cache file is raw data
-                            cached_config = None
-                            data = cached_payload
+                        if not is_valid_lm_eval_payload(data):
+                            raise ValueError(
+                                "cached file does not contain a valid lm_eval results payload"
+                            )
 
                         current_config = get_run_config(model, benchmark)
-                        # Intentionally ignore differences between cached_config and
-                        # current_config so we always reuse cached results.
+                        if not isinstance(cached_config, dict):
+                            raise ValueError(
+                                "cached file does not contain saved run configuration"
+                            )
+                        if cached_config != current_config:
+                            raise ValueError(
+                                "cached run configuration does not match the current request"
+                            )
 
                         status_text.text(
                             f"Using cached results for {benchmark.upper()} on {model}"
@@ -1226,10 +1337,7 @@ elif run_clicked:
                     continue
 
                 # Construct command: always use lm_eval as framework and this benchmark as the task
-                safe_model = model.replace("/", "_")
-                output_file = os.path.join(
-                    "saved_results", f"results_raw_{safe_model}_{benchmark}.json"
-                )
+                output_file = get_raw_result_path(model, benchmark)
                 cmd = [
                     sys.executable,
                     script_path,
@@ -1284,6 +1392,13 @@ elif run_clicked:
 
                 if apply_chat_template:
                     cmd.append("--apply_chat_template")
+                    if chat_template_kwargs is not None:
+                        cmd.extend(
+                            [
+                                "--chat_template_kwargs",
+                                json.dumps(chat_template_kwargs, sort_keys=True),
+                            ]
+                        )
 
                 # Run subprocess with real-time logging
                 process = None
@@ -1359,7 +1474,7 @@ elif run_clicked:
                         st.download_button(
                             label="Download Full Logs (Error)",
                             data=final_logs,
-                            file_name=f"logs_{model.replace('/', '_')}_{benchmark}_error.txt",
+                            file_name=f"logs_{get_model_filename_keys(model)[0]}_{benchmark}_error.txt",
                             mime="text/plain",
                         )
                         continue
@@ -1368,7 +1483,7 @@ elif run_clicked:
                     st.download_button(
                         label="Download Full Logs",
                         data=final_logs,
-                        file_name=f"logs_{model.replace('/', '_')}_{benchmark}.txt",
+                        file_name=f"logs_{get_model_filename_keys(model)[0]}_{benchmark}.txt",
                         mime="text/plain",
                     )
 
@@ -1379,8 +1494,13 @@ elif run_clicked:
                         )
                         continue
 
-                    with open(result_file, "r") as f:
-                        data = json.load(f)
+                    _, data = unpack_result_payload(load_json_file(result_file))
+
+                    if not is_valid_lm_eval_payload(data):
+                        st.error(
+                            f"Result file {result_file} for {model} on {benchmark} is not a valid lm_eval results payload"
+                        )
+                        continue
 
                     # Save a copy into cache with configuration
                     try:
