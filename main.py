@@ -75,9 +75,9 @@ def main():
     parser.add_argument(
         "--quantization",
         type=str,
-        default="4bit",
+        default="none",
         choices=["4bit", "8bit", "none"],
-        help="Quantization level",
+        help="Quantization level. Use 'none' for the most trustworthy and leaderboard-comparable results.",
     )
     parser.add_argument(
         "--deepeval", action="store_true", help="Run DeepEval on the results"

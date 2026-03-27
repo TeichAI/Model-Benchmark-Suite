@@ -74,9 +74,27 @@
 - **Planned fix:** Add validation before launch and surface a clear error in the UI/CLI.
 - **Status:** Completed
 
+### 8. Benchmark defaults encourage non-comparable runs
+
+- **Priority:** High
+- **Files:** `app.py`, `main.py`, `benchmarks/run_lm_eval.py`
+- **Problem:** The default quantization setting was low-bit, and the UI did not clearly flag generation overrides or sampling as benchmark-destabilizing settings.
+- **Impact:** Users can produce materially worse and less reproducible scores than public leaderboard-style evaluations without realizing the run is experimental.
+- **Planned fix:** Make full-precision the default path and add explicit warnings when low-bit quantization or sampling are enabled.
+- **Status:** Completed
+
+### 9. Reports described current UI state more clearly than actual run provenance
+
+- **Priority:** High
+- **Files:** `app.py`
+- **Problem:** Result views and exports emphasized current sidebar settings instead of the actual per-run configuration captured in saved results and raw `lm_eval` payloads.
+- **Impact:** Mixed-config runs could look directly comparable even when they were produced with different backends, quantization modes, few-shot overrides, limits, or sampling settings.
+- **Planned fix:** Extract run provenance from saved configs and raw payload metadata, surface a comparability table in the UI, and use that same data in exports.
+- **Status:** Completed
+
 ## Rough Edges
 
-### 8. Mutable default argument in `run_lm_eval`
+### 10. Mutable default argument in `run_lm_eval`
 
 - **Priority:** Low
 - **Files:** `benchmarks/run_lm_eval.py`
@@ -85,7 +103,7 @@
 - **Planned fix:** Change default to `None` and normalize inside the function.
 - **Status:** Completed
 
-### 9. Result file and cache wrapper flows are inconsistent
+### 11. Result file and cache wrapper flows are inconsistent
 
 - **Priority:** Low
 - **Files:** `app.py`, `main.py`
@@ -120,6 +138,11 @@
 - [x] Fix CPU-safe dtype selection
 - [x] Remove mutable default arguments and clean up result-loading rough edges
 
+### Phase 5: Benchmark trust and reporting
+
+- [x] Change benchmark defaults in the UI, CLI, and runner to prefer full-precision comparable runs
+- [x] Add run provenance and comparability diagnostics to the Streamlit results view and exports
+
 ## Progress Log
 
 ### Completed
@@ -139,6 +162,10 @@
 - [x] Updated `run_lm_eval.py` to remove the mutable default argument and use safer CPU dtype selection
 - [x] Added early native-Windows `vllm` guardrails in both the CLI and Streamlit UI
 - [x] Normalized raw-result and cache-wrapper loading through shared helpers in `app.py`
+- [x] Changed benchmark defaults in the UI, CLI, and runner to prefer full-precision comparable runs
+- [x] Added run provenance and comparability diagnostics to the Streamlit results view and exports
+- [x] Forced dark foreground text for highlighted comparison rows in `app.py`
+- [x] Auto-disabled chat templating for incompatible multiple-choice benchmarks in `app.py` and `benchmarks/run_lm_eval.py`
 
 ### In Progress
 

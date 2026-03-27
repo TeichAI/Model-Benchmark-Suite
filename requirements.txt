@@ -16,3 +16,4 @@ plotly
 deepeval
 openai
 tabulate
+reportlab

@@ -1,0 +1,76 @@
+# Evaluation results for TeichAI/Qwen3.5-4B-Claude-Opus-Reasoning
+# Evaluated using lm-evaluation-harness via TeichAI/Model-Benchmark-Suite
+# Date: 2026-03-25
+# NOTE: These are 0-shot results with sampling (temp=1.0). Standard benchmarks
+# use few-shot + greedy decoding, so these scores are not directly comparable
+# to leaderboard results. Re-evaluation with standard settings recommended.
+
+- dataset:
+    id: google/IFEval
+    task_id: ifeval
+  value: 30.8688
+  date: "2026-03-25"
+  source:
+    url: https://github.com/TeichAI/Model-Benchmark-Suite
+    name: TeichAI Model Benchmark Suite
+  notes: "prompt_level_strict_acc, 0-shot, temp=1.0 (non-standard)"
+
+- dataset:
+    id: allenai/ai2_arc
+    task_id: ARC-Challenge
+  value: 39.1638
+  date: "2026-03-25"
+  source:
+    url: https://github.com/TeichAI/Model-Benchmark-Suite
+    name: TeichAI Model Benchmark Suite
+  notes: "acc_norm, 0-shot, temp=1.0 (non-standard)"
+
+- dataset:
+    id: allenai/winogrande
+    task_id: winogrande_xl
+  value: 63.7727
+  date: "2026-03-25"
+  source:
+    url: https://github.com/TeichAI/Model-Benchmark-Suite
+    name: TeichAI Model Benchmark Suite
+  notes: "acc, 0-shot, temp=1.0 (non-standard)"
+
+- dataset:
+    id: Rowan/hellaswag
+    task_id: default
+  value: 50.0299
+  date: "2026-03-25"
+  source:
+    url: https://github.com/TeichAI/Model-Benchmark-Suite
+    name: TeichAI Model Benchmark Suite
+  notes: "acc_norm, 0-shot, temp=1.0 (non-standard)"
+
+- dataset:
+    id: Idavidrein/gpqa
+    task_id: gpqa_diamond
+  value: 28.2828
+  date: "2026-03-25"
+  source:
+    url: https://github.com/TeichAI/Model-Benchmark-Suite
+    name: TeichAI Model Benchmark Suite
+  notes: "acc, 0-shot, temp=1.0 (non-standard)"
+
+- dataset:
+    id: truthfulqa/truthful_qa
+    task_id: multiple_choice
+  value: 52.9941
+  date: "2026-03-25"
+  source:
+    url: https://github.com/TeichAI/Model-Benchmark-Suite
+    name: TeichAI Model Benchmark Suite
+  notes: "mc2 acc, 0-shot, temp=1.0 (non-standard)"
+
+- dataset:
+    id: cais/mmlu
+    task_id: default
+  value: 23.1662
+  date: "2026-03-25"
+  source:
+    url: https://github.com/TeichAI/Model-Benchmark-Suite
+    name: TeichAI Model Benchmark Suite
+  notes: "acc, 0-shot, temp=1.0 (non-standard)"

@@ -8,13 +8,27 @@ from lm_eval.models.huggingface import HFLM
 from lm_eval.models.utils_hf import clear_torch_cache
 
 
+CHAT_TEMPLATE_UNSAFE_TASKS = {
+    "arc_challenge",
+    "gpqa_diamond_zeroshot",
+    "hellaswag",
+    "mmlu",
+    "truthfulqa_mc2",
+    "winogrande",
+}
+
+
+def task_supports_chat_template(task_name):
+    return task_name not in CHAT_TEMPLATE_UNSAFE_TASKS
+
+
 def run_lm_eval(
     model_name,
     tasks_list=None,
     limit=None,
     batch_size=1,
     max_model_len=None,
-    quantization="4bit",
+    quantization="none",
     num_fewshot=None,
     override_gen_kwargs=False,
     do_sample=False,
@@ -31,9 +45,19 @@ def run_lm_eval(
     if tasks_list is None:
         tasks_list = ["gpqa_diamond_zeroshot"]
     tasks_list = list(tasks_list)
+    effective_apply_chat_template = bool(apply_chat_template)
+    incompatible_chat_template_tasks = [
+        task_name for task_name in tasks_list if not task_supports_chat_template(task_name)
+    ]
+    if effective_apply_chat_template and incompatible_chat_template_tasks:
+        effective_apply_chat_template = False
+        print(
+            "apply_chat_template=True requested, but it was auto-disabled for "
+            f"{incompatible_chat_template_tasks} because assistant-prefill/reasoning prefixes can corrupt multiple-choice likelihood benchmarking."
+        )
     chat_template_kwargs = (
         dict(chat_template_kwargs)
-        if apply_chat_template and chat_template_kwargs
+        if effective_apply_chat_template and chat_template_kwargs
         else None
     )
 
@@ -42,7 +66,7 @@ def run_lm_eval(
             "vLLM backend is not supported on native Windows. Use the hf backend or run under Linux/WSL."
         )
 
-    if apply_chat_template and "humaneval" in tasks_list:
+    if effective_apply_chat_template and "humaneval" in tasks_list:
         tasks_list = [
             "humaneval_instruct" if task == "humaneval" else task
             for task in tasks_list
@@ -131,7 +155,7 @@ def run_lm_eval(
                 batch_size="auto",
                 limit=limit,
                 confirm_run_unsafe_code=allow_code_eval,
-                apply_chat_template=apply_chat_template,
+                apply_chat_template=effective_apply_chat_template,
                 gen_kwargs=gen_kwargs,
                 log_samples=True,
             )
@@ -180,7 +204,7 @@ def run_lm_eval(
                 limit=limit,
                 device=device,
                 confirm_run_unsafe_code=allow_code_eval,
-                apply_chat_template=apply_chat_template,
+                apply_chat_template=effective_apply_chat_template,
                 gen_kwargs=gen_kwargs,
                 log_samples=True,
             )

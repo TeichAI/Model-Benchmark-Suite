@@ -15,6 +15,7 @@ import signal
 import datetime
 from collections import deque
 from urllib.parse import quote, unquote
+from xml.sax.saxutils import escape
 
 PLOTLY_DOWNLOAD_CONFIG = {
     "toImageButtonOptions": {
@@ -34,6 +35,63 @@ PLOTLY_MMLU_DOWNLOAD_CONFIG = {
     }
 }
 
+EVAL_RESULTS_FALLBACKS = {
+    "arc_challenge": {
+        "dataset_id": "allenai/ai2_arc",
+        "task_id": "ARC-Challenge",
+        "metric_name": "acc_norm",
+    },
+    "gpqa_diamond_zeroshot": {
+        "dataset_id": "Idavidrein/gpqa",
+        "task_id": "gpqa_diamond",
+        "metric_name": "acc",
+    },
+    "gsm8k": {
+        "dataset_id": "openai/gsm8k",
+        "task_id": "main",
+        "metric_name": "exact_match",
+    },
+    "hellaswag": {
+        "dataset_id": "Rowan/hellaswag",
+        "task_id": "default",
+        "metric_name": "acc_norm",
+    },
+    "humaneval": {
+        "dataset_id": "openai/openai_humaneval",
+        "task_id": "openai_humaneval",
+        "metric_name": "pass@1",
+    },
+    "ifeval": {
+        "dataset_id": "google/IFEval",
+        "task_id": "ifeval",
+        "metric_name": "prompt_level_strict_acc",
+    },
+    "mmlu": {
+        "dataset_id": "cais/mmlu",
+        "task_id": "default",
+        "metric_name": "acc",
+    },
+    "truthfulqa_mc2": {
+        "dataset_id": "truthfulqa/truthful_qa",
+        "task_id": "multiple_choice",
+        "metric_name": "mc2 acc",
+    },
+    "winogrande": {
+        "dataset_id": "allenai/winogrande",
+        "task_id": "winogrande_xl",
+        "metric_name": "acc",
+    },
+}
+
+CHAT_TEMPLATE_UNSAFE_BENCHMARKS = {
+    "arc_challenge",
+    "gpqa_diamond_zeroshot",
+    "hellaswag",
+    "mmlu",
+    "truthfulqa_mc2",
+    "winogrande",
+}
+
 def parse_json_object_input(value, field_name):
     if value is None:
         return None
@@ -47,6 +105,17 @@ def parse_json_object_input(value, field_name):
     if not isinstance(parsed, dict):
         raise ValueError(f"{field_name} must be a JSON object")
     return parsed
+
+
+def benchmark_supports_chat_template(benchmark):
+    return benchmark not in CHAT_TEMPLATE_UNSAFE_BENCHMARKS
+
+
+def get_effective_chat_template_settings(benchmark):
+    requested = bool(apply_chat_template)
+    enabled = requested and benchmark_supports_chat_template(benchmark)
+    disabled_reason = "task_incompatible" if requested and not enabled else None
+    return enabled, disabled_reason
 
 st.set_page_config(page_title="TeichAI Benchmark Suite", layout="wide")
 
@@ -96,7 +165,7 @@ with st.sidebar.expander("HuggingFace Token"):
         "Get one at https://huggingface.co/settings/tokens",
     )
     if hf_token:
-        st.success("Token provided ✓")
+        st.success("Token provided")
 
 # Settings
 backend_options = ["hf"] if native_windows else ["hf", "vllm"]
@@ -111,7 +180,16 @@ if native_windows:
     st.sidebar.info(
         "Native Windows detected: `vllm` is disabled in the UI. Use `hf` or run the suite under Linux/WSL for `vllm`."
     )
-quantization = st.sidebar.selectbox("Quantization", ["4bit", "8bit", "none"], index=0)
+quantization = st.sidebar.selectbox(
+    "Quantization",
+    ["4bit", "8bit", "none"],
+    index=2,
+    help="Use `none` for the most trustworthy and leaderboard-comparable results. Low-bit quantization is mainly a speed/memory tradeoff.",
+)
+if quantization != "none":
+    st.sidebar.warning(
+        "Low-bit quantization can materially change benchmark scores. Use `none` if you care about fair comparison."
+    )
 vllm_max_model_len_default = int(os.getenv("VLLM_MAX_MODEL_LEN", "8192"))
 vllm_max_model_len = st.sidebar.number_input(
     "vLLM Max Context Length",
@@ -156,6 +234,15 @@ if apply_chat_template:
         chat_template_kwargs_error = str(exc)
         if chat_template_kwargs_input.strip():
             st.sidebar.error(chat_template_kwargs_error)
+if apply_chat_template:
+    incompatible_chat_template_benchmarks = [
+        benchmark for benchmark in benchmarks if not benchmark_supports_chat_template(benchmark)
+    ]
+    if incompatible_chat_template_benchmarks:
+        st.sidebar.warning(
+            "Chat template will be auto-disabled for "
+            f"{', '.join(incompatible_chat_template_benchmarks)} because assistant-prefill/reasoning prefixes can corrupt multiple-choice likelihood benchmarking."
+        )
 overwrite_saved = st.sidebar.checkbox("Overwrite saved results", value=False)
 
 fewshot_mode = st.sidebar.selectbox(
@@ -187,29 +274,34 @@ with st.sidebar.expander("Sampling Parameters"):
         0.0,
         2.0,
         0.0,
-        disabled=not override_gen_kwargs,
     )
     top_p = st.slider(
         "Top P",
         0.0,
         1.0,
         1.0,
-        disabled=not override_gen_kwargs,
     )
     top_k = st.number_input(
         "Top K",
         value=0,
         min_value=0,
-        disabled=not override_gen_kwargs,
     )
     repetition_penalty = st.slider(
         "Repetition Penalty",
         1.0,
         2.0,
         1.0,
-        disabled=not override_gen_kwargs,
     )
     batch_size = st.number_input("Batch size (lm_eval)", min_value=1, value=1)
+
+if override_gen_kwargs:
+    st.sidebar.warning(
+        "Manual generation overrides make runs harder to compare across models and across reruns."
+    )
+if do_sample:
+    st.sidebar.error(
+        "Sampling is enabled. This run is experimental and should not be treated as a stable benchmark result."
+    )
 
 # Run / View Controls
 view_saved_only = st.sidebar.checkbox(
@@ -282,6 +374,206 @@ def unpack_result_payload(payload):
     return None, payload
 
 
+def coerce_scalar(value):
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        lowered = text.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        if lowered in {"none", "null"}:
+            return None
+        try:
+            if all(ch not in lowered for ch in [".", "e"]):
+                return int(text)
+        except ValueError:
+            pass
+        try:
+            return float(text)
+        except ValueError:
+            return text
+    return value
+
+
+def parse_model_args(model_args):
+    if isinstance(model_args, dict):
+        return dict(model_args)
+    if not isinstance(model_args, str):
+        return {}
+
+    parsed = {}
+    for item in model_args.split(","):
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        parsed[key.strip()] = coerce_scalar(value.strip())
+    return parsed
+
+
+def is_probably_chat_model(model_name):
+    lowered = str(model_name).lower()
+    return any(token in lowered for token in ["instruct", "chat", "assistant", "reasoning"])
+
+
+def load_saved_run_config(model, benchmark):
+    for candidate in get_cache_path_candidates(model, benchmark):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            candidate_config, candidate_data = unpack_result_payload(load_json_file(candidate))
+        except Exception:
+            continue
+        if isinstance(candidate_config, dict) and is_valid_lm_eval_payload(candidate_data):
+            return candidate_config
+    return None
+
+
+def extract_run_diagnostics(model, benchmark, data, saved_config=None):
+    lm_data = data.get("lm_eval", {}) if isinstance(data, dict) else {}
+    lm_config = lm_data.get("config", {}) if isinstance(lm_data, dict) else {}
+    if not isinstance(lm_config, dict):
+        lm_config = {}
+
+    saved_config = saved_config if isinstance(saved_config, dict) else {}
+    model_args = parse_model_args(lm_config.get("model_args"))
+    gen_kwargs = lm_config.get("gen_kwargs")
+    if not isinstance(gen_kwargs, dict):
+        gen_kwargs = {}
+
+    backend_name = saved_config.get("backend") or lm_config.get("model") or "-"
+    quantization_name = saved_config.get("quantization")
+    if not quantization_name:
+        if model_args.get("load_in_4bit") is True:
+            quantization_name = "4bit"
+        elif model_args.get("load_in_8bit") is True:
+            quantization_name = "8bit"
+        elif model_args.get("quantization") == "bitsandbytes":
+            quantization_name = "low-bit"
+        else:
+            quantization_name = "none"
+
+    override_generation = bool(saved_config.get("override_gen_kwargs")) or bool(gen_kwargs)
+    if override_generation:
+        sampling_enabled = bool(saved_config.get("do_sample")) if saved_config else bool(gen_kwargs.get("do_sample"))
+        temperature_value = saved_config.get("temperature") if saved_config else gen_kwargs.get("temperature")
+        top_p_value = saved_config.get("top_p") if saved_config else gen_kwargs.get("top_p")
+        top_k_value = saved_config.get("top_k") if saved_config else gen_kwargs.get("top_k")
+        repetition_penalty_value = saved_config.get("repetition_penalty") if saved_config else gen_kwargs.get("repetition_penalty")
+    else:
+        sampling_enabled = False
+        temperature_value = None
+        top_p_value = None
+        top_k_value = None
+        repetition_penalty_value = None
+
+    apply_chat_template_value = saved_config.get("apply_chat_template")
+    chat_template_disabled_reason = saved_config.get("chat_template_disabled_reason")
+    if apply_chat_template_value is None:
+        if "chat_template_args" in model_args or "enable_thinking" in model_args:
+            apply_chat_template_value = True
+
+    thinking_value = None
+    chat_template_kwargs_value = saved_config.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs_value, dict):
+        thinking_value = chat_template_kwargs_value.get("enable_thinking")
+    if thinking_value is None:
+        chat_template_args_value = model_args.get("chat_template_args")
+        if isinstance(chat_template_args_value, dict):
+            thinking_value = chat_template_args_value.get("enable_thinking")
+    if thinking_value is None:
+        thinking_value = model_args.get("enable_thinking")
+
+    limit_value = lm_config.get("limit")
+    limit_display = "full" if limit_value is None else str(limit_value)
+    fewshot_value = saved_config.get("num_fewshot")
+    fewshot_display = "task default" if fewshot_value is None else str(fewshot_value)
+    batch_size_value = saved_config.get("batch_size", lm_config.get("batch_size", "-"))
+    precision_value = model_args.get("dtype") or lm_config.get("model_dtype") or "-"
+    device_value = lm_config.get("device") or "-"
+    seed_parts = [
+        lm_config.get("random_seed"),
+        lm_config.get("numpy_seed"),
+        lm_config.get("torch_seed"),
+    ]
+    seed_values = [str(seed) for seed in seed_parts if seed is not None]
+    seeds_display = ", ".join(seed_values) if seed_values else "-"
+
+    notes = []
+    if limit_value is not None:
+        notes.append(f"partial dataset (limit={limit_display})")
+    if quantization_name in {"4bit", "8bit", "low-bit"}:
+        notes.append(f"{quantization_name} quantization")
+    if sampling_enabled:
+        notes.append("sampling enabled")
+    if fewshot_value is not None:
+        notes.append(f"few-shot override={fewshot_display}")
+    if (
+        apply_chat_template_value is False
+        and is_probably_chat_model(model)
+        and chat_template_disabled_reason != "task_incompatible"
+    ):
+        notes.append("chat template disabled")
+
+    comparable = not notes
+    if apply_chat_template_value is True:
+        chat_template_display = "On"
+    elif chat_template_disabled_reason == "task_incompatible":
+        chat_template_display = "Auto-disabled"
+    elif apply_chat_template_value is False:
+        chat_template_display = "Off"
+    else:
+        chat_template_display = "Unknown"
+
+    if thinking_value is True:
+        thinking_display = "On"
+    elif thinking_value is False:
+        thinking_display = "Off"
+    else:
+        thinking_display = "-"
+
+    return {
+        "Model": model,
+        "Benchmark": benchmark,
+        "Comparable": "Yes" if comparable else "No",
+        "Backend": backend_name,
+        "Quantization": quantization_name,
+        "Sampling": "On" if sampling_enabled else "Off",
+        "Temperature": "-" if temperature_value is None else str(temperature_value),
+        "Top P": "-" if top_p_value is None else str(top_p_value),
+        "Top K": "-" if top_k_value is None else str(top_k_value),
+        "Repetition Penalty": "-" if repetition_penalty_value is None else str(repetition_penalty_value),
+        "Few-shot": fewshot_display,
+        "Limit": limit_display,
+        "Chat Template": chat_template_display,
+        "Thinking": thinking_display,
+        "Batch Size": str(batch_size_value),
+        "Precision": str(precision_value),
+        "Device": str(device_value),
+        "Seeds": seeds_display,
+        "Notes": "; ".join(notes) if notes else "None detected",
+    }
+
+
+def build_result_entry(model, benchmark, data, saved_config=None):
+    score, total_questions, total_correct = summarize_results(model, benchmark, data)
+    diagnostics = extract_run_diagnostics(model, benchmark, data, saved_config=saved_config)
+    return {
+        "Model": model,
+        "Benchmark": benchmark,
+        "Score": score,
+        "Total Questions": int(total_questions),
+        "Total Correct": int(total_correct),
+        "Comparable": diagnostics["Comparable"],
+        "Notes": diagnostics["Notes"],
+        "Run Config": saved_config,
+        "Run Diagnostics": diagnostics,
+        "Details": data,
+    }
+
+
 def render_results(results_data):
     if not results_data:
         return
@@ -317,6 +609,77 @@ def render_results(results_data):
         st.info("No data for current selection.")
         return
 
+    filtered_results = [
+        item
+        for item in results_data
+        if item["Model"] in selected_models and item["Benchmark"] in selected_benchmarks
+    ]
+    diagnostics_df = pd.DataFrame(
+        [item.get("Run Diagnostics", {}) for item in filtered_results]
+    )
+    provenance_columns = [
+        "Model",
+        "Benchmark",
+        "Comparable",
+        "Backend",
+        "Quantization",
+        "Sampling",
+        "Temperature",
+        "Few-shot",
+        "Limit",
+        "Chat Template",
+        "Thinking",
+        "Batch Size",
+        "Precision",
+        "Device",
+        "Seeds",
+        "Notes",
+    ]
+    provenance_export_df = (
+        diagnostics_df[provenance_columns].copy() if not diagnostics_df.empty else pd.DataFrame()
+    )
+    long_form_df = pd.DataFrame(
+        [
+            {
+                "Model": item["Model"],
+                "Benchmark": item["Benchmark"],
+                "Score": item["Score"],
+                "Total Questions": item["Total Questions"],
+                "Total Correct": item["Total Correct"],
+                "Comparable": (item.get("Run Diagnostics") or {}).get("Comparable", "Unknown"),
+                "Backend": (item.get("Run Diagnostics") or {}).get("Backend", "-"),
+                "Quantization": (item.get("Run Diagnostics") or {}).get("Quantization", "-"),
+                "Sampling": (item.get("Run Diagnostics") or {}).get("Sampling", "-"),
+                "Chat Template": (item.get("Run Diagnostics") or {}).get("Chat Template", "-"),
+                "Limit": (item.get("Run Diagnostics") or {}).get("Limit", "-"),
+                "Notes": (item.get("Run Diagnostics") or {}).get("Notes", "-"),
+            }
+            for item in filtered_results
+        ]
+    )
+
+    if not diagnostics_df.empty:
+        displayed_runs = int(len(diagnostics_df))
+        comparable_runs = int((diagnostics_df["Comparable"] == "Yes").sum())
+        experimental_runs = displayed_runs - comparable_runs
+        partial_runs = int((diagnostics_df["Limit"] != "full").sum())
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Displayed runs", displayed_runs)
+        metric_cols[1].metric("Comparable runs", comparable_runs)
+        metric_cols[2].metric("Experimental runs", experimental_runs)
+        metric_cols[3].metric("Partial runs", partial_runs)
+
+        if experimental_runs:
+            st.warning(
+                "Some displayed results were produced under settings that make direct comparison unreliable. Check the run provenance table before trusting rank order."
+            )
+
+        st.subheader("Run Provenance")
+        st.caption(
+            "These fields are extracted from saved run configs and lm_eval output so you can see what was actually run."
+        )
+        st.dataframe(provenance_export_df, use_container_width=True)
+
     score_matrix = (
         filtered_df.pivot_table(
             index="Benchmark", columns="Model", values="Score", aggfunc="mean"
@@ -331,11 +694,36 @@ def render_results(results_data):
             return ["" for _ in row]
         winner = valid.max()
         return [
-            "background-color: #dcfce7; font-weight: 700;"
+            "background-color: #dcfce7; color: #166534; font-weight: 700;"
             if pd.notna(v) and v == winner
             else ""
             for v in row
         ]
+
+    def _highlight_outcome_row(row):
+        outcome = row.get("Outcome")
+        if outcome == "Primary model ahead":
+            style = "background-color: #dcfce7; color: #111827;"
+        elif outcome == "Comparison models ahead":
+            style = "background-color: #fee2e2; color: #111827;"
+        elif outcome == "Tie":
+            style = "background-color: #fef3c7; color: #111827;"
+        else:
+            style = ""
+        return [style for _ in row]
+
+    def _highlight_delta_column(values):
+        styles = []
+        for value in values:
+            if pd.isna(value):
+                styles.append("")
+            elif float(value) > 0:
+                styles.append("color: #166534; font-weight: 700;")
+            elif float(value) < 0:
+                styles.append("color: #991b1b; font-weight: 700;")
+            else:
+                styles.append("color: #92400e; font-weight: 700;")
+        return styles
 
     def _score_to_text(v):
         return "-" if pd.isna(v) else f"{float(v):.3f}"
@@ -379,15 +767,19 @@ def render_results(results_data):
     with st.expander("View matrix in markdown format"):
         st.markdown(_safe_to_markdown(score_matrix_md_df))
 
+    st.subheader("Head-to-head model comparison")
+    st.caption(
+        "Choose the primary model first, then add the comparison models you want to measure it against."
+    )
     base_model = st.selectbox(
-        "Base model for win/loss analysis",
+        "Primary model",
         options=selected_models,
         index=0,
         key="base_model_select",
     )
     compare_options = [m for m in selected_models if m != base_model]
     compare_models = st.multiselect(
-        "Compare these models against base",
+        "Comparison models",
         options=compare_options,
         default=compare_options,
         key="compare_models_select",
@@ -411,18 +803,18 @@ def render_results(results_data):
             avg_delta = float((pair[base_model] - pair[model_name]).mean())
             summary_rows.append(
                 {
-                    "Model": model_name,
+                    "Comparison Model": model_name,
                     "Benchmarks Compared": int(len(pair)),
-                    "Base Wins": base_wins,
-                    "Base Losses": base_losses,
+                    "Primary Model Wins": base_wins,
+                    "Primary Model Losses": base_losses,
                     "Ties": ties,
-                    "Avg Delta (Base-Model)": avg_delta,
+                    "Avg Score Gap (Primary - Comparison)": avg_delta,
                 }
             )
 
         if summary_rows:
             comparison_summary_df = pd.DataFrame(summary_rows).sort_values(
-                "Avg Delta (Base-Model)", ascending=False
+                "Avg Score Gap (Primary - Comparison)", ascending=False
             )
 
         outcome_rows = []
@@ -437,18 +829,18 @@ def render_results(results_data):
             best_competitor_score = float(competitor_scores.max())
             delta = float(base_score - best_competitor_score)
             if delta > 0:
-                outcome = "Win"
+                outcome = "Primary model ahead"
             elif delta < 0:
-                outcome = "Loss"
+                outcome = "Comparison models ahead"
             else:
                 outcome = "Tie"
             outcome_rows.append(
                 {
                     "Benchmark": benchmark_name,
-                    "Base Score": float(base_score),
-                    "Best Opponent": best_competitor,
-                    "Opponent Score": best_competitor_score,
-                    "Delta (Base-Opponent)": delta,
+                    "Primary Model Score": float(base_score),
+                    "Best Comparison Model": best_competitor,
+                    "Best Comparison Score": best_competitor_score,
+                    "Score Gap (Primary - Best Comparison)": delta,
                     "Outcome": outcome,
                 }
             )
@@ -457,39 +849,49 @@ def render_results(results_data):
             benchmark_outcome_df = pd.DataFrame(outcome_rows).sort_values("Benchmark")
 
         if not benchmark_outcome_df.empty:
-            wins = int((benchmark_outcome_df["Outcome"] == "Win").sum())
-            losses = int((benchmark_outcome_df["Outcome"] == "Loss").sum())
+            wins = int((benchmark_outcome_df["Outcome"] == "Primary model ahead").sum())
+            losses = int((benchmark_outcome_df["Outcome"] == "Comparison models ahead").sum())
             ties = int((benchmark_outcome_df["Outcome"] == "Tie").sum())
             key_takeaways.append(
-                f"{base_model}: {wins} wins, {losses} losses, {ties} ties across selected benchmarks."
+                f"Primary model ({base_model}): {wins} wins, {losses} losses, {ties} ties across selected benchmarks."
             )
         if not comparison_summary_df.empty:
             strongest = comparison_summary_df.iloc[-1]
             weakest = comparison_summary_df.iloc[0]
             key_takeaways.append(
-                f"Hardest competitor vs base: {strongest['Model']} (Avg Δ={strongest['Avg Delta (Base-Model)']:.3f})."
+                f"Hardest comparison model: {strongest['Comparison Model']} (Avg Δ={strongest['Avg Score Gap (Primary - Comparison)']:.3f})."
             )
             key_takeaways.append(
-                f"Easiest competitor vs base: {weakest['Model']} (Avg Δ={weakest['Avg Delta (Base-Model)']:.3f})."
+                f"Easiest comparison model: {weakest['Comparison Model']} (Avg Δ={weakest['Avg Score Gap (Primary - Comparison)']:.3f})."
             )
 
     if not benchmark_outcome_df.empty:
-        st.subheader("Where Base Model Wins/Loses")
+        st.subheader("Benchmark-by-benchmark comparison")
         st.dataframe(
             benchmark_outcome_df.style.format(
                 {
-                    "Base Score": "{:.3f}",
-                    "Opponent Score": "{:.3f}",
-                    "Delta (Base-Opponent)": "{:.3f}",
+                    "Primary Model Score": "{:.3f}",
+                    "Best Comparison Score": "{:.3f}",
+                    "Score Gap (Primary - Best Comparison)": "{:.3f}",
                 }
+            ).apply(_highlight_outcome_row, axis=1).apply(
+                _highlight_delta_column,
+                subset=["Score Gap (Primary - Best Comparison)"],
+                axis=0,
             ),
             use_container_width=True,
         )
 
     if not comparison_summary_df.empty:
-        st.subheader("Base vs Variant Summary")
+        st.subheader("Comparison summary")
         st.dataframe(
-            comparison_summary_df.style.format({"Avg Delta (Base-Model)": "{:.3f}"}),
+            comparison_summary_df.style.format(
+                {"Avg Score Gap (Primary - Comparison)": "{:.3f}"}
+            ).apply(
+                _highlight_delta_column,
+                subset=["Avg Score Gap (Primary - Comparison)"],
+                axis=0,
+            ),
             use_container_width=True,
         )
 
@@ -505,7 +907,7 @@ def render_results(results_data):
         y="Score",
         color="Benchmark",
         barmode="group",
-        title=f"Benchmark Results (Quant: {quantization})",
+        title="Benchmark Results",
         text_auto=".2f",
     )
     fig.update_layout(
@@ -528,9 +930,7 @@ def render_results(results_data):
 
     with st.expander("View long-form rows"):
         st.dataframe(
-            filtered_df[
-                ["Model", "Benchmark", "Score", "Total Questions", "Total Correct"]
-            ],
+            long_form_df,
             use_container_width=True,
         )
 
@@ -544,24 +944,31 @@ def render_results(results_data):
 
     md_content = "# Benchmark Results Report\n\n"
     md_content += f"**Date:** {display_timestamp}\n\n"
-    md_content += "## Configuration\n"
-    md_content += f"- **Quantization:** {quantization}\n"
-    md_content += f"- **Temperature:** {temperature}\n"
-    md_content += f"- **Top P:** {top_p}\n"
-    md_content += f"- **Top K:** {top_k}\n"
-    md_content += f"- **Repetition Penalty:** {repetition_penalty}\n"
-    md_content += f"- **Base Model:** {base_model}\n\n"
+    md_content += "## Scope\n"
+    md_content += f"- **Displayed models:** {', '.join(selected_models)}\n"
+    md_content += f"- **Displayed benchmarks:** {', '.join(selected_benchmarks)}\n"
+    md_content += f"- **Primary comparison model:** {base_model}\n"
+    if not diagnostics_df.empty:
+        md_content += f"- **Comparable runs:** {comparable_runs}/{displayed_runs}\n"
+        md_content += f"- **Experimental runs:** {experimental_runs}\n"
+        md_content += f"- **Partial runs:** {partial_runs}\n"
+    md_content += "\n"
+
+    if not provenance_export_df.empty:
+        md_content += "## Run Provenance\n\n"
+        md_content += _safe_to_markdown(provenance_export_df)
+        md_content += "\n\n"
 
     md_content += "## Head-to-Head Score Matrix\n\n"
     md_content += _safe_to_markdown(score_matrix_md_df)
 
     if not benchmark_outcome_df.empty:
-        md_content += "\n\n## Where Base Model Wins/Loses\n\n"
+        md_content += "\n\n## Benchmark-by-benchmark comparison\n\n"
         benchmark_outcome_export = benchmark_outcome_df.copy()
         md_content += _safe_to_markdown(benchmark_outcome_export)
 
     if not comparison_summary_df.empty:
-        md_content += "\n\n## Base vs Variant Summary\n\n"
+        md_content += "\n\n## Comparison summary\n\n"
         md_content += _safe_to_markdown(comparison_summary_df)
 
     if key_takeaways:
@@ -570,9 +977,7 @@ def render_results(results_data):
             md_content += f"- {line}\n"
 
     md_content += "\n\n## Full Row Data\n\n"
-    md_content += _safe_to_markdown(
-        filtered_df[["Model", "Benchmark", "Score", "Total Questions", "Total Correct"]]
-    )
+    md_content += _safe_to_markdown(long_form_df)
 
     mmlu_filtered = None
     mmlu_subject_results = st.session_state.get("mmlu_subject_results")
@@ -608,21 +1013,7 @@ def render_results(results_data):
     # Generate chart images for ZIP/PDF exports
     results_image_bytes = None
     try:
-        # Use a light template and explicit background for exported charts
-        fig_export = go.Figure(fig)
-        fig_export.update_layout(
-            template="plotly_white",
-            paper_bgcolor="white",
-            plot_bgcolor="white",
-            font=dict(color="black"),
-        )
-        results_image_bytes = pio.to_image(
-            fig_export,
-            format="png",
-            width=PLOTLY_DOWNLOAD_CONFIG["toImageButtonOptions"]["width"],
-            height=PLOTLY_DOWNLOAD_CONFIG["toImageButtonOptions"]["height"],
-            scale=PLOTLY_DOWNLOAD_CONFIG["toImageButtonOptions"]["scale"],
-        )
+        results_image_bytes = export_plotly_figure(fig, PLOTLY_DOWNLOAD_CONFIG)
     except Exception as e:
         results_image_bytes = None
         st.warning(
@@ -642,10 +1033,6 @@ def render_results(results_data):
                 text_auto=".2f",
             )
             fig_mmlu_export.update_layout(
-                template="plotly_white",
-                paper_bgcolor="white",
-                plot_bgcolor="white",
-                font=dict(color="black"),
                 yaxis=dict(range=[0, 1], fixedrange=True),
                 xaxis_tickangle=-45,
                 legend=dict(
@@ -657,12 +1044,9 @@ def render_results(results_data):
                 ),
                 margin=dict(t=80, b=150, l=60, r=60),
             )
-            mmlu_image_bytes = pio.to_image(
+            mmlu_image_bytes = export_plotly_figure(
                 fig_mmlu_export,
-                format="png",
-                width=PLOTLY_MMLU_DOWNLOAD_CONFIG["toImageButtonOptions"]["width"],
-                height=PLOTLY_MMLU_DOWNLOAD_CONFIG["toImageButtonOptions"]["height"],
-                scale=PLOTLY_MMLU_DOWNLOAD_CONFIG["toImageButtonOptions"]["scale"],
+                PLOTLY_MMLU_DOWNLOAD_CONFIG,
             )
         except Exception as e:
             mmlu_image_bytes = None
@@ -686,7 +1070,7 @@ def render_results(results_data):
     pdf_bytes = None
     pdf_error = None
     try:
-        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.pagesizes import letter, landscape
         from reportlab.platypus import (
             SimpleDocTemplate,
             Paragraph,
@@ -702,7 +1086,7 @@ def render_results(results_data):
         pdf_buffer = io.BytesIO()
         doc = SimpleDocTemplate(
             pdf_buffer,
-            pagesize=letter,
+            pagesize=landscape(letter),
             rightMargin=50,
             leftMargin=50,
             topMargin=50,
@@ -734,19 +1118,45 @@ def render_results(results_data):
             fontSize=10,
             leading=13,
         )
+        table_header_style = ParagraphStyle(
+            "TableHeader",
+            parent=body_style,
+            fontName="Helvetica-Bold",
+            fontSize=8,
+            leading=10,
+            textColor=colors.white,
+            wordWrap="CJK",
+        )
+        table_cell_style = ParagraphStyle(
+            "TableCell",
+            parent=body_style,
+            fontSize=8,
+            leading=10,
+            wordWrap="CJK",
+        )
 
         def _build_table(table_df, highlight_winners=False):
             cols = list(table_df.columns)
-            data = [cols]
+            data = [[Paragraph(escape(str(col)), table_header_style) for col in cols]]
             for _, row in table_df.iterrows():
-                data.append([str(row[c]) for c in cols])
+                data.append(
+                    [Paragraph(escape(str(row[c])), table_cell_style) for c in cols]
+                )
 
-            report_table = Table(data, repeatRows=1)
+            report_table = Table(
+                data,
+                repeatRows=1,
+                splitByRow=1,
+                colWidths=[doc.width / max(len(cols), 1)] * len(cols),
+            )
             style_cmds = [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F2937")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("LEADING", (0, 0), (-1, -1), 10),
                 ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F9FAFB")]),
             ]
@@ -768,18 +1178,18 @@ def render_results(results_data):
                         if pd.notna(score) and score == winner_score:
                             style_cmds.append(
                                 (
-                                    "FONTNAME",
-                                    (col_idx, row_idx),
-                                    (col_idx, row_idx),
-                                    "Helvetica-Bold",
-                                )
-                            )
-                            style_cmds.append(
-                                (
                                     "BACKGROUND",
                                     (col_idx, row_idx),
                                     (col_idx, row_idx),
                                     colors.HexColor("#DCFCE7"),
+                                )
+                            )
+                            style_cmds.append(
+                                (
+                                    "TEXTCOLOR",
+                                    (col_idx, row_idx),
+                                    (col_idx, row_idx),
+                                    colors.HexColor("#166534"),
                                 )
                             )
 
@@ -793,20 +1203,34 @@ def render_results(results_data):
 
         # Configuration block
         elements.append(Paragraph(f"<b>Date:</b> {display_timestamp}", body_style))
-        elements.append(Paragraph(f"<b>Quantization:</b> {quantization}", body_style))
-        elements.append(Paragraph(f"<b>Temperature:</b> {temperature}", body_style))
-        elements.append(Paragraph(f"<b>Top P:</b> {top_p}", body_style))
-        elements.append(Paragraph(f"<b>Top K:</b> {top_k}", body_style))
-        elements.append(
-            Paragraph(f"<b>Repetition Penalty:</b> {repetition_penalty}", body_style)
-        )
-        elements.append(Paragraph(f"<b>Base Model:</b> {base_model}", body_style))
+        elements.append(Paragraph(f"<b>Displayed models:</b> {', '.join(selected_models)}", body_style))
+        elements.append(Paragraph(f"<b>Displayed benchmarks:</b> {', '.join(selected_benchmarks)}", body_style))
+        elements.append(Paragraph(f"<b>Primary comparison model:</b> {base_model}", body_style))
+        if not diagnostics_df.empty:
+            elements.append(Paragraph(f"<b>Comparable runs:</b> {comparable_runs}/{displayed_runs}", body_style))
+            elements.append(Paragraph(f"<b>Experimental runs:</b> {experimental_runs}", body_style))
+            elements.append(Paragraph(f"<b>Partial runs:</b> {partial_runs}", body_style))
 
         if key_takeaways:
             elements.append(Spacer(1, 12))
             elements.append(Paragraph("Quick Read", heading_style))
             for line in key_takeaways:
-                elements.append(Paragraph(f"• {line}", body_style))
+                elements.append(Paragraph(f"- {line}", body_style))
+        if not provenance_export_df.empty:
+            elements.append(Spacer(1, 12))
+            elements.append(Paragraph("Run Provenance", heading_style))
+            elements.append(_build_table(provenance_export_df[[
+                "Model",
+                "Benchmark",
+                "Comparable",
+                "Backend",
+                "Quantization",
+                "Sampling",
+                "Few-shot",
+                "Limit",
+                "Chat Template",
+                "Notes",
+            ]]))
 
         elements.append(Spacer(1, 12))
         elements.append(Paragraph("Head-to-Head Score Matrix", heading_style))
@@ -818,18 +1242,22 @@ def render_results(results_data):
 
         if not benchmark_outcome_df.empty:
             elements.append(Spacer(1, 12))
-            elements.append(Paragraph("Where Base Model Wins/Loses", heading_style))
+            elements.append(Paragraph("Benchmark-by-benchmark comparison", heading_style))
             outcome_pdf = benchmark_outcome_df.copy()
-            for col in ["Base Score", "Opponent Score", "Delta (Base-Opponent)"]:
+            for col in [
+                "Primary Model Score",
+                "Best Comparison Score",
+                "Score Gap (Primary - Best Comparison)",
+            ]:
                 outcome_pdf[col] = outcome_pdf[col].map(lambda v: f"{float(v):.3f}")
             elements.append(_build_table(outcome_pdf))
 
         if not comparison_summary_df.empty:
             elements.append(Spacer(1, 12))
-            elements.append(Paragraph("Base vs Variant Summary", heading_style))
+            elements.append(Paragraph("Comparison summary", heading_style))
             summary_pdf = comparison_summary_df.copy()
-            summary_pdf["Avg Delta (Base-Model)"] = summary_pdf[
-                "Avg Delta (Base-Model)"
+            summary_pdf["Avg Score Gap (Primary - Comparison)"] = summary_pdf[
+                "Avg Score Gap (Primary - Comparison)"
             ].map(lambda v: f"{float(v):.3f}")
             elements.append(_build_table(summary_pdf))
 
@@ -970,6 +1398,169 @@ def render_results(results_data):
             st.subheader("Detailed Qualitative Feedback")
             st.dataframe(df_deep)
 
+    st.subheader("Export for .eval_results")
+    eval_results_model = st.selectbox(
+        "Model to export as `.eval_results/benchmarks.yml`",
+        options=selected_models,
+        index=0,
+        key="eval_results_model_select",
+    )
+    eval_results_entries = [
+        item for item in filtered_results if item["Model"] == eval_results_model
+    ]
+    if eval_results_entries:
+        st.download_button(
+            label="Download `.eval_results/benchmarks.yml` bundle",
+            data=build_eval_results_bundle(eval_results_model, eval_results_entries),
+            file_name=f"{get_model_filename_keys(eval_results_model)[0]}_eval_results.zip",
+            mime="application/zip",
+        )
+    else:
+        st.info("No displayed results are available for the selected `.eval_results` export model.")
+
+def get_task_config(data, benchmark):
+    lm_data = data.get("lm_eval", {}) if isinstance(data, dict) else {}
+    configs = lm_data.get("configs", {}) if isinstance(lm_data, dict) else {}
+    task_config = configs.get(benchmark) if isinstance(configs, dict) else None
+    return task_config if isinstance(task_config, dict) else {}
+
+def get_primary_metric_name(data, benchmark):
+    lm_data = data.get("lm_eval", {}) if isinstance(data, dict) else {}
+    lm_results = lm_data.get("results", {}) if isinstance(lm_data, dict) else {}
+    task_metrics = lm_results.get(benchmark, {}) if isinstance(lm_results, dict) else {}
+    if not isinstance(task_metrics, dict):
+        return None
+    metric_keys = [
+        "acc,none",
+        "acc_norm,none",
+        "exact_match,none",
+        "prompt_level_strict_acc,none",
+        "pass@1,create_test",
+        "pass@1,none",
+        "pass@1",
+    ]
+    for key in metric_keys:
+        if task_metrics.get(key) is not None:
+            return key.split(",", 1)[0]
+    return None
+
+def format_score_percent(score):
+    return f"{float(score) * 100:.4f}".rstrip("0").rstrip(".")
+
+def build_eval_results_note(result_entry):
+    benchmark = result_entry.get("Benchmark")
+    diagnostics = result_entry.get("Run Diagnostics") or {}
+    fallback = EVAL_RESULTS_FALLBACKS.get(benchmark, {})
+    parts = []
+
+    metric_name = get_primary_metric_name(result_entry.get("Details", {}), benchmark) or fallback.get("metric_name")
+    if metric_name:
+        parts.append(metric_name)
+
+    fewshot_value = diagnostics.get("Few-shot")
+    if fewshot_value == "task default":
+        parts.append("task-default few-shot")
+    elif fewshot_value not in {None, "", "-"}:
+        parts.append(f"{fewshot_value}-shot")
+
+    if diagnostics.get("Sampling") == "On":
+        temperature_value = diagnostics.get("Temperature")
+        if temperature_value not in {None, "", "-"}:
+            parts.append(f"temp={temperature_value}")
+        parts.append("sampling")
+
+    quantization_value = diagnostics.get("Quantization")
+    if quantization_value not in {None, "", "-", "none"}:
+        parts.append(f"{quantization_value} quantization")
+
+    note_text = ", ".join(parts) if parts else "exported from Model Benchmark Suite"
+    if diagnostics.get("Comparable") != "Yes":
+        note_text += " (non-standard)"
+    return note_text
+
+def build_eval_results_yaml(model_name, result_entries):
+    export_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    has_nonstandard = any(
+        (entry.get("Run Diagnostics") or {}).get("Comparable") != "Yes"
+        for entry in result_entries
+    )
+    lines = [
+        f"# Evaluation results for {model_name}",
+        "# Evaluated using lm-evaluation-harness via TeichAI/Model-Benchmark-Suite",
+        f"# Date: {export_date}",
+    ]
+    if has_nonstandard:
+        lines.extend(
+            [
+                "# NOTE: One or more exported runs use non-standard settings.",
+                "# Check per-entry notes before comparing these values to leaderboard runs.",
+            ]
+        )
+    lines.append("")
+
+    for entry in sorted(result_entries, key=lambda item: str(item.get("Benchmark", ""))):
+        benchmark = entry.get("Benchmark")
+        task_config = get_task_config(entry.get("Details", {}), benchmark)
+        fallback = EVAL_RESULTS_FALLBACKS.get(benchmark, {})
+        dataset_id = task_config.get("dataset_path") or fallback.get("dataset_id") or str(benchmark)
+        task_id = task_config.get("dataset_name") or fallback.get("task_id") or str(benchmark)
+        lines.extend(
+            [
+                "- dataset:",
+                f"    id: {dataset_id}",
+                f"    task_id: {task_id}",
+                f"  value: {format_score_percent(entry.get('Score', 0))}",
+                f"  date: \"{export_date}\"",
+                "  source:",
+                "    url: https://github.com/TeichAI/Model-Benchmark-Suite",
+                "    name: TeichAI Model Benchmark Suite",
+                f"  notes: {json.dumps(build_eval_results_note(entry))}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+def build_eval_results_bundle(model_name, result_entries):
+    zip_buffer = io.BytesIO()
+    yaml_content = build_eval_results_yaml(model_name, result_entries)
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(".eval_results/benchmarks.yml", yaml_content)
+    return zip_buffer.getvalue()
+
+def export_plotly_figure(figure, download_config):
+    options = download_config.get("toImageButtonOptions", {})
+    width = int(options.get("width", 1400))
+    height = int(options.get("height", 800))
+    scale = int(options.get("scale", 2))
+    export_figure = go.Figure(figure)
+    export_figure.update_layout(
+        template="plotly_white",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font=dict(color="black"),
+        autosize=False,
+        width=width,
+        height=height,
+    )
+    export_figure.update_xaxes(automargin=True)
+    export_figure.update_yaxes(automargin=True)
+    export_figure.update_traces(textposition="none", cliponaxis=False)
+    try:
+        return pio.to_image(
+            export_figure,
+            format="png",
+            width=width,
+            height=height,
+            scale=scale,
+        )
+    except TypeError:
+        return export_figure.to_image(
+            format="png",
+            width=width,
+            height=height,
+            scale=scale,
+            engine="kaleido",
+        )
 
 def render_mmlu_breakdown(mmlu_results):
     if not mmlu_results:
@@ -1054,7 +1645,6 @@ def render_mmlu_breakdown(mmlu_results):
         ]
     )
 
-
 def summarize_results(model, benchmark, data):
     # Extract score and details
     score = 0
@@ -1130,8 +1720,10 @@ def summarize_results(model, benchmark, data):
 
     return score, total_questions, total_correct
 
-
 def get_run_config(model, benchmark):
+    effective_apply_chat_template, chat_template_disabled_reason = (
+        get_effective_chat_template_settings(benchmark)
+    )
     return {
         "model": model,
         "benchmark": benchmark,
@@ -1139,8 +1731,10 @@ def get_run_config(model, benchmark):
         "quantization": quantization,
         "max_model_len": int(vllm_max_model_len) if backend == "vllm" else None,
         "allow_code_eval": bool(allow_code_eval),
-        "apply_chat_template": bool(apply_chat_template),
-        "chat_template_kwargs": chat_template_kwargs if apply_chat_template else None,
+        "apply_chat_template_requested": bool(apply_chat_template),
+        "apply_chat_template": effective_apply_chat_template,
+        "chat_template_disabled_reason": chat_template_disabled_reason,
+        "chat_template_kwargs": chat_template_kwargs if effective_apply_chat_template else None,
         "num_fewshot": None if num_fewshot is None else int(num_fewshot),
         "override_gen_kwargs": bool(override_gen_kwargs),
         "do_sample": bool(do_sample) if override_gen_kwargs else False,
@@ -1150,7 +1744,6 @@ def get_run_config(model, benchmark):
         "repetition_penalty": float(repetition_penalty) if override_gen_kwargs else None,
         "batch_size": int(batch_size),
     }
-
 
 def load_all_saved_results():
     """Load all lm_eval results from raw JSON files in saved_results/ without running benchmarks."""
@@ -1213,18 +1806,12 @@ def load_all_saved_results():
                 # Skip unresolved models instead of labeling them as "unknown_model".
                 continue
 
-            score, total_questions, total_correct = summarize_results(
-                model, benchmark, data
+            entry = build_result_entry(
+                model,
+                benchmark,
+                data,
+                saved_config=load_saved_run_config(model, benchmark),
             )
-
-            entry = {
-                "Model": model,
-                "Benchmark": benchmark,
-                "Score": score,
-                "Total Questions": int(total_questions),
-                "Total Correct": int(total_correct),
-                "Details": data,
-            }
 
             if isinstance(benchmark, str) and benchmark.startswith("mmlu_"):
                 mmlu_subject_results.append(entry)
@@ -1308,18 +1895,13 @@ elif run_clicked:
                             f"Using cached results for {benchmark.upper()} on {model}"
                         )
 
-                        score, total_questions, total_correct = summarize_results(
-                            model, benchmark, data
-                        )
                         results_list.append(
-                            {
-                                "Model": model,
-                                "Benchmark": benchmark,
-                                "Score": score,
-                                "Total Questions": int(total_questions),
-                                "Total Correct": int(total_correct),
-                                "Details": data,
-                            }
+                            build_result_entry(
+                                model,
+                                benchmark,
+                                data,
+                                saved_config=cached_config,
+                            )
                         )
                         st.session_state.results = results_list
                         continue
@@ -1390,7 +1972,10 @@ elif run_clicked:
                 if allow_code_eval:
                     cmd.append("--allow_code_eval")
 
-                if apply_chat_template:
+                effective_apply_chat_template, _ = get_effective_chat_template_settings(
+                    benchmark
+                )
+                if effective_apply_chat_template:
                     cmd.append("--apply_chat_template")
                     if chat_template_kwargs is not None:
                         cmd.extend(
@@ -1504,8 +2089,9 @@ elif run_clicked:
 
                     # Save a copy into cache with configuration
                     try:
+                        current_config = get_run_config(model, benchmark)
                         cache_payload = {
-                            "config": get_run_config(model, benchmark),
+                            "config": current_config,
                             "data": data,
                         }
                         with open(cache_path, "w") as f:
@@ -1515,19 +2101,13 @@ elif run_clicked:
                             f"Failed to write cached results for {model} on {benchmark}: {e}"
                         )
 
-                    score, total_questions, total_correct = summarize_results(
-                        model, benchmark, data
-                    )
-
                     results_list.append(
-                        {
-                            "Model": model,
-                            "Benchmark": benchmark,
-                            "Score": score,
-                            "Total Questions": int(total_questions),
-                            "Total Correct": int(total_correct),
-                            "Details": data,
-                        }
+                        build_result_entry(
+                            model,
+                            benchmark,
+                            data,
+                            saved_config=current_config,
+                        )
                     )
 
                     st.session_state.results = results_list
